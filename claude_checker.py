@@ -3,7 +3,7 @@
 Claude Code Limits Checker & Telegram Notifier
 ----------------------------------------------
 Multi-Account & Remote Server / Coolify / Docker Support.
-Часовой пояс: UTC+2.
+Часовой пояс: UTC+2. Авто-паузы и ретраи для предотвращения 429 Too Many Requests.
 """
 
 import os
@@ -212,7 +212,7 @@ def refresh_oauth_token_direct(refresh_token):
             pass
 
         if e.code == 400 or "invalid_grant" in str(err_msg).lower():
-            raise RuntimeError("Токен аннулирован или истек. Требуется выполнить 'claude auth login' на Mac и экспортировать CONFIG_JSON.")
+            raise RuntimeError("Сессия истекла (invalid_grant). Требуется повторный вход в аккаунт.")
         raise RuntimeError(f"HTTP {e.code}: {err_msg or e.reason}")
 
 # --- Account Usage Fetcher ---
@@ -251,16 +251,30 @@ def get_active_accounts(config):
 
     return accounts
 
-def fetch_usage_for_token(token):
+def fetch_usage_for_token(token, retries=2):
     headers = {
         "Authorization": f"Bearer {token}",
         "anthropic-version": "2023-06-01",
         "User-Agent": USER_AGENT,
         "Content-Type": "application/json"
     }
-    req = urllib.request.Request(API_USAGE_URL, headers=headers)
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(API_USAGE_URL, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt < retries:
+                retry_after_str = e.headers.get("retry-after") or e.headers.get("Retry-After")
+                try:
+                    wait_sec = float(retry_after_str) if retry_after_str else 3.0
+                except ValueError:
+                    wait_sec = 3.0
+
+                time.sleep(wait_sec)
+                continue
+            raise e
 
 def fetch_account_usage(account, config):
     acc_type = account.get("type", "keychain" if IS_MACOS else "token")
@@ -339,7 +353,10 @@ def fetch_account_usage(account, config):
 def fetch_all_accounts_usage(config):
     accounts = get_active_accounts(config)
     results = []
-    for acc in accounts:
+    for idx, acc in enumerate(accounts):
+        if idx > 0:
+            time.sleep(2.0)  # Пауза 2 секунды между запросами во избежание IP Rate Limit (429)
+
         usage, err = fetch_account_usage(acc, config)
         results.append({
             "account": acc,
