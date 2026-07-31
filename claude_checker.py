@@ -3,7 +3,7 @@
 Claude Code Limits Checker & Telegram Notifier
 ----------------------------------------------
 Multi-Account & Remote Server / Coolify / Docker Support.
-Часовой пояс: UTC+2.
+Часовой пояс: UTC+2. Форматирование сообщений: HTML с гарантированной доставкой.
 """
 
 import os
@@ -11,6 +11,7 @@ import sys
 import json
 import time
 import re
+import html
 import platform
 import urllib.request
 import urllib.parse
@@ -35,6 +36,11 @@ IS_MACOS = platform.system() == "Darwin"
 TZ_OFFSET_HOURS = 2
 DISPLAY_TZ = timezone(timedelta(hours=TZ_OFFSET_HOURS))
 
+def escape_html(text):
+    if not text:
+        return ""
+    return html.escape(str(text))
+
 # --- Config Management (File + Coolify ENV) ---
 
 def load_config():
@@ -48,7 +54,6 @@ def load_config():
         "accounts": []
     }
 
-    # 1. Загрузка из config.json только если это реальный ФАЙЛ (а не директория, созданная Docker)
     if os.path.exists(CONFIG_FILE) and os.path.isfile(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -57,7 +62,6 @@ def load_config():
         except (IsADirectoryError, OSError, json.JSONDecodeError):
             pass
 
-    # 2. Переопределение / загрузка из ENV переменных (для Coolify / Docker)
     env_config_json = os.environ.get("CONFIG_JSON")
     if env_config_json:
         try:
@@ -89,7 +93,6 @@ def load_config():
     return cfg
 
 def save_config(config):
-    # Не пытаемся писать если путь это директория
     if os.path.exists(CONFIG_FILE) and os.path.isdir(CONFIG_FILE):
         return
     try:
@@ -235,7 +238,7 @@ def get_active_accounts(config):
     for svc in discovered_services:
         if svc not in existing_services:
             if svc == DEFAULT_KEYCHAIN_SERVICE:
-                label = f"Основной ({primary_email})" if primary_email else "Основной аккаунт"
+                label = primary_email if primary_email else "Основной аккаунт"
             else:
                 label = f"Аккаунт ({svc.replace('Claude Code-credentials-', '')})"
 
@@ -249,7 +252,7 @@ def get_active_accounts(config):
     if not accounts and IS_MACOS:
         accounts.append({
             "id": DEFAULT_KEYCHAIN_SERVICE,
-            "name": f"Основной ({primary_email})" if primary_email else "Основной аккаунт",
+            "name": primary_email if primary_email else "Основной аккаунт",
             "type": "keychain",
             "keychain_service": DEFAULT_KEYCHAIN_SERVICE
         })
@@ -394,7 +397,7 @@ def export_config():
                     if svc in custom_names:
                         label = custom_names[svc]
                     elif svc == DEFAULT_KEYCHAIN_SERVICE:
-                        label = f"Основной ({primary_email})" if primary_email else "Основной аккаунт"
+                        label = primary_email if primary_email else "Основной аккаунт"
                     else:
                         label = f"Аккаунт ({svc.replace('Claude Code-credentials-', '')})"
 
@@ -485,24 +488,24 @@ def get_status_emoji(percent):
     else:
         return "🟢"
 
-# --- Output Formatters ---
+# --- Output Formatters (HTML) ---
 
 def format_status_report(results):
     if not results:
         return "⚠️ Нет настроенных аккаунтов для проверки."
 
-    lines = [f"📊 *Состояние лимитов Claude Code* ({len(results)} акк.)\n"]
+    lines = [f"📊 <b>Состояние лимитов Claude Code</b> ({len(results)} акк.)\n"]
 
     for idx, item in enumerate(results, 1):
         acc = item["account"]
-        acc_name = acc.get("name") or f"Аккаунт #{idx}"
+        acc_name = escape_html(acc.get("name") or f"Аккаунт #{idx}")
         data = item["usage"]
         err = item["error"]
 
-        lines.append(f"👤 *{acc_name}*")
+        lines.append(f"👤 <b>{acc_name}</b>")
 
         if err:
-            lines.append(f"   ⚠️ _Ошибка: {err}_\n")
+            lines.append(f"   ⚠️ <i>Ошибка: {escape_html(err)}</i>\n")
             continue
 
         five_h = data.get("five_hour", {})
@@ -510,9 +513,9 @@ def format_status_report(results):
         reset5_dt = parse_iso_time(five_h.get("resets_at"))
         emoji5 = get_status_emoji(p5)
 
-        lines.append(f"   {emoji5} *5-часовой лимит:* `{p5:.1f}%`")
+        lines.append(f"   {emoji5} <b>5-часовой лимит:</b> <code>{p5:.1f}%</code>")
         if p5 >= 100:
-            lines.append(f"      • ⏳ Сброс через: *{format_countdown(reset5_dt)}* (в {format_local_time(reset5_dt)})")
+            lines.append(f"      • ⏳ Сброс через: <b>{format_countdown(reset5_dt)}</b> (в {format_local_time(reset5_dt)})")
         elif reset5_dt and (reset5_dt - datetime.now(timezone.utc)).total_seconds() > 0:
             lines.append(f"      • ⏳ Сброс в: {format_local_time(reset5_dt)} (через {format_countdown(reset5_dt)})")
 
@@ -521,7 +524,7 @@ def format_status_report(results):
         reset7_dt = parse_iso_time(seven_d.get("resets_at"))
         emoji7 = get_status_emoji(p7)
 
-        lines.append(f"   {emoji7} *7-дневный лимит:* `{p7:.1f}%`")
+        lines.append(f"   {emoji7} <b>7-дневный лимит:</b> <code>{p7:.1f}%</code>")
         if reset7_dt and (reset7_dt - datetime.now(timezone.utc)).total_seconds() > 0:
             lines.append(f"      • ⏳ Сброс в: {format_local_time(reset7_dt)} (через {format_countdown(reset7_dt)})")
 
@@ -531,12 +534,12 @@ def format_status_report(results):
             used_c = extra.get("used_credits", 0.0) or 0.0
             limit_c = extra.get("monthly_limit", 0.0) or 0.0
             emoji_ext = get_status_emoji(p_ext)
-            lines.append(f"   {emoji_ext} *Extra Usage:* `{p_ext:.1f}%` (${used_c / 100:.2f} / ${limit_c / 100:.2f})")
+            lines.append(f"   {emoji_ext} <b>Extra Usage:</b> <code>{p_ext:.1f}%</code> (${used_c / 100:.2f} / ${limit_c / 100:.2f})")
 
         lines.append("")
 
     now_str = datetime.now(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M:%S (UTC+2)")
-    lines.append(f"_Обновлено: {now_str}_")
+    lines.append(f"<i>Обновлено: {now_str}</i>")
 
     return "\n".join(lines)
 
@@ -587,7 +590,20 @@ def format_console_report(results):
 
 # --- Telegram API ---
 
-def send_telegram_message(bot_token, chat_id, text):
+def send_chat_action(bot_token, chat_id, action="typing"):
+    if not bot_token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/sendChatAction"
+    payload = {"chat_id": chat_id, "action": action}
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            pass
+    except Exception:
+        pass
+
+def send_telegram_message(bot_token, chat_id, text, parse_mode="HTML"):
     if not bot_token or not chat_id:
         print("⚠️ Bot token или Chat ID не настроены!")
         return False
@@ -596,9 +612,11 @@ def send_telegram_message(bot_token, chat_id, text):
     payload = {
         "chat_id": chat_id,
         "text": text,
-        "parse_mode": "Markdown",
         "disable_web_page_preview": True
     }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
 
@@ -606,6 +624,13 @@ def send_telegram_message(bot_token, chat_id, text):
         with urllib.request.urlopen(req, timeout=10) as resp:
             res_json = json.loads(resp.read().decode("utf-8"))
             return res_json.get("ok", False)
+    except urllib.error.HTTPError as e:
+        # Если разметка HTML была отклонена Telegram, отправляем обычным текстом без тегов!
+        if parse_mode is not None:
+            clean_text = text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "").replace("<code>", "").replace("</code>", "")
+            return send_telegram_message(bot_token, chat_id, clean_text, parse_mode=None)
+        print(f"⚠️ Ошибка отправки сообщения в Telegram: {e}")
+        return False
     except Exception as e:
         print(f"⚠️ Ошибка отправки сообщения в Telegram: {e}")
         return False
@@ -668,7 +693,7 @@ def run_setup():
         config["chat_id"] = chat_id
         save_config(config)
         print("\n🎉 Настройка Telegram завершена успешно!")
-        if send_telegram_message(config["bot_token"], config["chat_id"], "🤖 *Claude Limits Checker* успешно настроен и готов к работе!"):
+        if send_telegram_message(config["bot_token"], config["chat_id"], "🤖 <b>Claude Limits Checker</b> успешно настроен и готов к работе!"):
             print("✅ Тестовое сообщение отправлено в Telegram!")
         else:
             print("❌ Ошибка при отправке тестового сообщения.")
@@ -801,8 +826,8 @@ def run_daemon():
 
     send_telegram_message(
         bot_token, chat_id,
-        "🚀 *Claude Limits Checker запущен в контейнере!*\n"
-        "Отправьте `/status` или `/check` для получения текущего состояния всех аккаунтов."
+        "🚀 <b>Claude Limits Checker запущен в контейнере!</b>\n"
+        "Отправьте <code>/status</code> или <code>/check</code> для получения текущего состояния всех аккаунтов."
     )
 
     offset = None
@@ -823,7 +848,7 @@ def run_daemon():
                 for item in results:
                     acc = item["account"]
                     acc_id = acc.get("keychain_service") or acc.get("id") or acc.get("name")
-                    acc_name = acc.get("name", "Аккаунт")
+                    acc_name = escape_html(acc.get("name", "Аккаунт"))
                     data = item["usage"]
 
                     if not data:
@@ -839,8 +864,8 @@ def run_daemon():
                     # Переход в состояние "Лимит 100%"
                     if is_limited and not was_limited and config.get("notify_on_limit_reached", True):
                         msg = (
-                            f"⚠️ *[{acc_name}] Достигнут 100% лимит Claude Code!*\n\n"
-                            f"⏳ Сброс ожидается через: *{format_countdown(reset5_dt)}* (в {format_local_time(reset5_dt)})\n\n"
+                            f"⚠️ <b>[{acc_name}] Достигнут 100% лимит Claude Code!</b>\n\n"
+                            f"⏳ Сброс ожидается через: <b>{format_countdown(reset5_dt)}</b> (в {format_local_time(reset5_dt)})\n\n"
                             "🔔 Я пришлю уведомление, как только лимит сбросится!"
                         )
                         send_telegram_message(bot_token, chat_id, msg)
@@ -849,8 +874,8 @@ def run_daemon():
                     # Переход в состояние "Лимит Сбросился"
                     elif not is_limited and was_limited and config.get("notify_on_reset", True):
                         msg = (
-                            f"🎉 *[{acc_name}] Лимиты Claude Code сбросились!*\n\n"
-                            f"🟢 5-часовой лимит доступен (использовано: {p5:.1f}%).\n"
+                            f"🎉 <b>[{acc_name}] Лимиты Claude Code сбросились!</b>\n\n"
+                            f"🟢 5-часовой лимит доступен (использовано: <code>{p5:.1f}%</code>).\n"
                             "Вы можете продолжать работу!"
                         )
                         send_telegram_message(bot_token, chat_id, msg)
@@ -876,19 +901,20 @@ def run_daemon():
                         msg_chat_id = str(up["message"]["chat"]["id"])
 
                         if text in ["/status", "/check", "статус", "лимиты"]:
+                            send_chat_action(bot_token, msg_chat_id, "typing")
                             try:
                                 results = fetch_all_accounts_usage(config)
                                 report = format_status_report(results)
                                 send_telegram_message(bot_token, msg_chat_id, report)
                             except Exception as err:
-                                send_telegram_message(bot_token, msg_chat_id, f"❌ Ошибка получения лимитов: {err}")
+                                send_telegram_message(bot_token, msg_chat_id, f"❌ <i>Ошибка получения лимитов: {escape_html(err)}</i>")
 
                         elif text in ["/start", "/help", "помощь"]:
                             help_text = (
-                                "🤖 *Claude Code Limits Checker (Coolify / Docker)*\n\n"
+                                "🤖 <b>Claude Code Limits Checker (Coolify / Docker)</b>\n\n"
                                 "Команды:\n"
-                                "• `/status` или `/check` — проверить текущие лимиты всех аккаунтов\n"
-                                "• `/help` — справка\n\n"
+                                "• <code>/status</code> или <code>/check</code> — проверить текущие лимиты всех аккаунтов\n"
+                                "• <code>/help</code> — справка\n\n"
                                 "Бот автоматически проверяет ваши аккаунты и уведомляет, когда лимиты превышены или сбросились!"
                             )
                             send_telegram_message(bot_token, msg_chat_id, help_text)
