@@ -177,12 +177,9 @@ def refresh_claude_cli_token():
 # --- Direct OAuth Refresh (Coolify / Remote VPS / Docker) ---
 
 def refresh_oauth_token_direct(refresh_token):
-    """
-    Прямое обновление OAuth токена через API Anthropic.
-    Параметр scope убран из запроса во избежание ошибки 400 Bad Request.
-    """
-    if not refresh_token:
-        raise ValueError("Отсутствует refresh_token для ротации ключа")
+    """Прямое обновление OAuth токена через API Anthropic."""
+    if not refresh_token or not refresh_token.strip():
+        raise ValueError("Токен ротации отсутствует. Выполните 'claude auth login' на Mac и повторите экспорт.")
 
     payload = {
         "grant_type": "refresh_token",
@@ -214,8 +211,8 @@ def refresh_oauth_token_direct(refresh_token):
         except Exception:
             pass
 
-        if "invalid_grant" in str(err_msg).lower() or e.code == 400:
-            raise RuntimeError("Сессия истекла (invalid_grant). Требуется повторный вход в аккаунт.")
+        if e.code == 400 or "invalid_grant" in str(err_msg).lower():
+            raise RuntimeError("Токен аннулирован или истек. Требуется выполнить 'claude auth login' на Mac и экспортировать CONFIG_JSON.")
         raise RuntimeError(f"HTTP {e.code}: {err_msg or e.reason}")
 
 # --- Account Usage Fetcher ---
@@ -280,6 +277,8 @@ def fetch_account_usage(account, config):
                 data = fetch_usage_for_token(token)
                 return data, None
             except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    return None, "Превышен лимит частых запросов к API (HTTP 429). Ожидайте автоматического обновления."
                 if e.code == 401:
                     if rf_token:
                         try:
@@ -301,13 +300,15 @@ def fetch_account_usage(account, config):
             rf_token = account.get("refresh_token")
 
             if not token and not rf_token:
-                return None, "Токены не указаны в настройках"
+                return None, "Токены отсутствуют в конфиге. Выполните 'claude auth login' и повторите export"
 
             if token:
                 try:
                     data = fetch_usage_for_token(token)
                     return data, None
                 except urllib.error.HTTPError as e:
+                    if e.code == 429:
+                        return None, "Превышен лимит частых запросов к API (HTTP 429). Ожидайте следующей проверки."
                     if e.code != 401 or not rf_token:
                         raise e
 
@@ -321,14 +322,16 @@ def fetch_account_usage(account, config):
                     data = fetch_usage_for_token(new_acc)
                     return data, None
                 except Exception as refresh_err:
-                    return None, f"Ошибка ротации токена: {refresh_err}"
+                    return None, f"{refresh_err}"
 
         else:
             return None, f"Неподдерживаемый тип аккаунта ({acc_type}) для этой ОС"
 
     except urllib.error.HTTPError as e:
+        if e.code == 429:
+            return None, "Превышен лимит частых запросов к API (HTTP 429). Ожидайте следующей проверки."
         if e.code == 401:
-            return None, "Истек срок действия токена (HTTP 401 Требуется переавторизация)"
+            return None, "Истек срок действия токена (HTTP 401 Требуется повторный вход)"
         return None, f"Ошибка API Anthropic (HTTP {e.code}): {e.reason}"
     except Exception as e:
         return None, str(e)
