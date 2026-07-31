@@ -3,7 +3,7 @@
 Claude Code Limits Checker & Telegram Notifier
 ----------------------------------------------
 Multi-Account & Remote Server / Coolify / Docker Support.
-Часовой пояс: UTC+2. Авто-паузы и ретраи для предотвращения 429 Too Many Requests.
+Часовой пояс: UTC+2.
 """
 
 import os
@@ -48,14 +48,16 @@ def load_config():
         "accounts": []
     }
 
-    if os.path.exists(CONFIG_FILE):
+    # 1. Загрузка из config.json только если это реальный ФАЙЛ (а не директория, созданная Docker)
+    if os.path.exists(CONFIG_FILE) and os.path.isfile(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 file_cfg = json.load(f)
                 cfg.update(file_cfg)
-        except Exception as e:
-            print(f"⚠️ Ошибка чтения {CONFIG_FILE}: {e}")
+        except (IsADirectoryError, OSError, json.JSONDecodeError):
+            pass
 
+    # 2. Переопределение / загрузка из ENV переменных (для Coolify / Docker)
     env_config_json = os.environ.get("CONFIG_JSON")
     if env_config_json:
         try:
@@ -87,6 +89,9 @@ def load_config():
     return cfg
 
 def save_config(config):
+    # Не пытаемся писать если путь это директория
+    if os.path.exists(CONFIG_FILE) and os.path.isdir(CONFIG_FILE):
+        return
     try:
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
@@ -95,7 +100,7 @@ def save_config(config):
 
 def get_primary_email():
     p = os.path.expanduser("~/.claude.json")
-    if os.path.exists(p):
+    if os.path.exists(p) and os.path.isfile(p):
         try:
             with open(p, "r", encoding="utf-8") as f:
                 d = json.load(f)
@@ -355,7 +360,7 @@ def fetch_all_accounts_usage(config):
     results = []
     for idx, acc in enumerate(accounts):
         if idx > 0:
-            time.sleep(2.0)  # Пауза 2 секунды между запросами во избежание IP Rate Limit (429)
+            time.sleep(2.0)
 
         usage, err = fetch_account_usage(acc, config)
         results.append({
