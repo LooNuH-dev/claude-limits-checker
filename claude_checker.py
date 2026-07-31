@@ -3,7 +3,7 @@
 Claude Code Limits Checker & Telegram Notifier
 ----------------------------------------------
 Multi-Account & Remote Server / Coolify / Docker Support.
-Поддерживает автоопределение email аккаунта и переименование.
+Часовой пояс: UTC+2.
 """
 
 import os
@@ -17,7 +17,7 @@ import urllib.parse
 import urllib.error
 import subprocess
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True)
@@ -30,6 +30,10 @@ OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 USER_AGENT = "claude-code/0.2.29"
 
 IS_MACOS = platform.system() == "Darwin"
+
+# Часовой пояс UTC+2
+TZ_OFFSET_HOURS = 2
+DISPLAY_TZ = timezone(timedelta(hours=TZ_OFFSET_HOURS))
 
 # --- Config Management (File + Coolify ENV) ---
 
@@ -140,6 +144,26 @@ def get_keychain_credentials(service_name=DEFAULT_KEYCHAIN_SERVICE):
     except Exception as e:
         raise RuntimeError(f"Не удалось прочитать Keychain ({service_name}): {e}")
 
+def update_keychain_credentials(service_name, new_access_token, new_refresh_token):
+    if not IS_MACOS:
+        return
+    try:
+        res = subprocess.run(
+            ["security", "find-generic-password", "-s", service_name, "-w"],
+            capture_output=True, text=True, check=True
+        )
+        data = json.loads(res.stdout.strip())
+        if "claudeAiOauth" in data:
+            data["claudeAiOauth"]["accessToken"] = new_access_token
+            data["claudeAiOauth"]["refreshToken"] = new_refresh_token
+            new_json_str = json.dumps(data)
+            subprocess.run(
+                ["security", "add-generic-password", "-U", "-s", service_name, "-w", new_json_str],
+                capture_output=True, check=True
+            )
+    except Exception:
+        pass
+
 def refresh_claude_cli_token():
     if not IS_MACOS:
         return None
@@ -152,22 +176,18 @@ def refresh_claude_cli_token():
 
 # --- Direct OAuth Refresh (Coolify / Remote VPS / Docker) ---
 
-def refresh_oauth_token_direct(refresh_token, scopes=None):
+def refresh_oauth_token_direct(refresh_token):
+    """
+    Прямое обновление OAuth токена через API Anthropic.
+    Параметр scope убран из запроса во избежание ошибки 400 Bad Request.
+    """
     if not refresh_token:
         raise ValueError("Отсутствует refresh_token для ротации ключа")
-
-    if not scopes:
-        scope_str = "user:file_upload user:inference user:mcp_servers user:profile user:sessions:claude_code"
-    elif isinstance(scopes, list):
-        scope_str = " ".join(scopes)
-    else:
-        scope_str = str(scopes)
 
     payload = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "client_id": OAUTH_CLIENT_ID,
-        "scope": scope_str
+        "client_id": OAUTH_CLIENT_ID
     }
 
     data = json.dumps(payload).encode("utf-8")
@@ -180,11 +200,23 @@ def refresh_oauth_token_direct(refresh_token, scopes=None):
         }
     )
 
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        res_json = json.loads(resp.read().decode("utf-8"))
-        new_access_token = res_json.get("access_token")
-        new_refresh_token = res_json.get("refresh_token") or refresh_token
-        return new_access_token, new_refresh_token
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            res_json = json.loads(resp.read().decode("utf-8"))
+            new_access_token = res_json.get("access_token")
+            new_refresh_token = res_json.get("refresh_token") or refresh_token
+            return new_access_token, new_refresh_token
+    except urllib.error.HTTPError as e:
+        err_msg = ""
+        try:
+            err_body = json.loads(e.read().decode("utf-8"))
+            err_msg = err_body.get("error", {}).get("message") or err_body.get("error") or str(err_body)
+        except Exception:
+            pass
+
+        if "invalid_grant" in str(err_msg).lower() or e.code == 400:
+            raise RuntimeError("Сессия истекла (invalid_grant). Требуется повторный вход в аккаунт.")
+        raise RuntimeError(f"HTTP {e.code}: {err_msg or e.reason}")
 
 # --- Account Usage Fetcher ---
 
@@ -239,10 +271,10 @@ def fetch_account_usage(account, config):
     try:
         if acc_type == "keychain" and IS_MACOS:
             svc = account.get("keychain_service", DEFAULT_KEYCHAIN_SERVICE)
-            token, rf_token, scopes = get_keychain_credentials(svc)
+            token, rf_token, _ = get_keychain_credentials(svc)
 
             if not token and not rf_token:
-                return None, f"Токен отсутствует в Keychain ({svc})"
+                return None, f"Токен отсутствует в Keychain ({svc}). Запустите 'claude auth login'"
 
             try:
                 data = fetch_usage_for_token(token)
@@ -251,7 +283,8 @@ def fetch_account_usage(account, config):
                 if e.code == 401:
                     if rf_token:
                         try:
-                            new_acc, new_rf = refresh_oauth_token_direct(rf_token, scopes)
+                            new_acc, new_rf = refresh_oauth_token_direct(rf_token)
+                            update_keychain_credentials(svc, new_acc, new_rf)
                             data = fetch_usage_for_token(new_acc)
                             return data, None
                         except Exception:
@@ -266,7 +299,6 @@ def fetch_account_usage(account, config):
         elif acc_type == "token":
             token = account.get("access_token")
             rf_token = account.get("refresh_token")
-            scopes = account.get("scopes")
 
             if not token and not rf_token:
                 return None, "Токены не указаны в настройках"
@@ -281,7 +313,7 @@ def fetch_account_usage(account, config):
 
             if rf_token:
                 try:
-                    new_acc, new_rf = refresh_oauth_token_direct(rf_token, scopes)
+                    new_acc, new_rf = refresh_oauth_token_direct(rf_token)
                     account["access_token"] = new_acc
                     account["refresh_token"] = new_rf
                     save_config(config)
@@ -289,14 +321,14 @@ def fetch_account_usage(account, config):
                     data = fetch_usage_for_token(new_acc)
                     return data, None
                 except Exception as refresh_err:
-                    return None, f"Ошибка автообновления токена: {refresh_err}"
+                    return None, f"Ошибка ротации токена: {refresh_err}"
 
         else:
             return None, f"Неподдерживаемый тип аккаунта ({acc_type}) для этой ОС"
 
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            return None, "Истек срок действия токена (HTTP 401 Требуется повторный вход)"
+            return None, "Истек срок действия токена (HTTP 401 Требуется переавторизация)"
         return None, f"Ошибка API Anthropic (HTTP {e.code}): {e.reason}"
     except Exception as e:
         return None, str(e)
@@ -382,7 +414,7 @@ def export_config():
 
     return payload
 
-# --- Helper Formatting Functions ---
+# --- Helper Formatting Functions (UTC+2) ---
 
 def parse_iso_time(iso_str):
     if not iso_str:
@@ -414,10 +446,11 @@ def format_countdown(target_dt):
     return " ".join(parts)
 
 def format_local_time(target_dt):
+    """Форматирует время в часовом поясе UTC+2"""
     if not target_dt:
         return "—"
-    local_dt = target_dt.astimezone()
-    return local_dt.strftime("%H:%M (%d.%m)")
+    dt_tz = target_dt.astimezone(DISPLAY_TZ)
+    return dt_tz.strftime("%H:%M (%d.%m UTC+2)")
 
 def get_status_emoji(percent):
     if percent >= 100:
@@ -477,7 +510,7 @@ def format_status_report(results):
 
         lines.append("")
 
-    now_str = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+    now_str = datetime.now(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M:%S (UTC+2)")
     lines.append(f"_Обновлено: {now_str}_")
 
     return "\n".join(lines)
@@ -486,7 +519,7 @@ def format_console_report(results):
     if not results:
         return "⚠️ Нет настроенных аккаунтов для проверки."
 
-    lines = ["=" * 50, f"   СОСТОЯНИЕ ЛИМИТОВ CLAUDE CODE ({len(results)} акк.)", "=" * 50]
+    lines = ["=" * 50, f"   СОСТОЯНИЕ ЛИМИТОВ CLAUDE CODE ({len(results)} акк.) [UTC+2]", "=" * 50]
 
     for idx, item in enumerate(results, 1):
         acc = item["account"]
@@ -739,7 +772,7 @@ def run_daemon():
         sys.exit(1)
 
     print("🚀 Запуск фонового демона мониторинга (Multi-Account & Coolify) и Telegram-бота...")
-    print(f"   Частота проверки: каждые {config.get('check_interval_minutes', 5)} мин.")
+    print(f"   Частота проверки: каждые {config.get('check_interval_minutes', 5)} мин. Часовой пояс: UTC+2.")
 
     send_telegram_message(
         bot_token, chat_id,
