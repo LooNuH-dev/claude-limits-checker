@@ -1,0 +1,23 @@
+{
+  "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
+  "chat_id": "YOUR_TELEGRAM_CHAT_ID",
+  "check_interval_minutes": 5,
+  "notify_on_reset": true,
+  "notify_on_limit_reached": true,
+  "auto_discover_keychain": true,
+  "accounts": [
+    {
+      "name": "Основной аккаунт",
+      "type": "token",
+      "access_token": "sk-ant-oat01-YOUR_ACCESS_TOKEN",
+      "refresh_token": "sk-ant-ort01-YOUR_REFRESH_TOKEN",
+      "scopes": [
+        "user:file_upload",
+        "user:inference",
+        "user:mcp_servers",
+        "user:profile",
+        "user:sessions:claude_code"
+      ]
+    }
+  ]
+}
