@@ -3,7 +3,7 @@
 Claude Code Limits Checker & Telegram Notifier
 ----------------------------------------------
 Multi-Account & Remote Server / Coolify / Docker Support.
-Часовой пояс: UTC+2. Форматирование сообщений: HTML с гарантированной доставкой.
+Часовой пояс: UTC+2. Детальное логирование и удаление конфликтных Webhook.
 """
 
 import os
@@ -54,6 +54,7 @@ def load_config():
         "accounts": []
     }
 
+    # 1. Загрузка из config.json только если это реальный ФАЙЛ
     if os.path.exists(CONFIG_FILE) and os.path.isfile(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -62,10 +63,14 @@ def load_config():
         except (IsADirectoryError, OSError, json.JSONDecodeError):
             pass
 
+    # 2. Переопределение / загрузка из ENV переменных (для Coolify / Docker)
     env_config_json = os.environ.get("CONFIG_JSON")
     if env_config_json:
         try:
-            parsed = json.loads(env_config_json)
+            raw_val = env_config_json.strip()
+            if (raw_val.startswith("'") and raw_val.endswith("'")) or (raw_val.startswith('"') and raw_val.endswith('"')):
+                raw_val = raw_val[1:-1].strip()
+            parsed = json.loads(raw_val)
             cfg.update(parsed)
         except Exception as e:
             print(f"⚠️ Ошибка разбора CONFIG_JSON из ENV: {e}")
@@ -590,6 +595,17 @@ def format_console_report(results):
 
 # --- Telegram API ---
 
+def delete_telegram_webhook(bot_token):
+    if not bot_token:
+        return
+    url = f"https://api.telegram.org/bot{bot_token}/deleteWebhook?drop_pending_updates=False"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            pass
+    except Exception:
+        pass
+
 def send_chat_action(bot_token, chat_id, action="typing"):
     if not bot_token or not chat_id:
         return
@@ -625,7 +641,6 @@ def send_telegram_message(bot_token, chat_id, text, parse_mode="HTML"):
             res_json = json.loads(resp.read().decode("utf-8"))
             return res_json.get("ok", False)
     except urllib.error.HTTPError as e:
-        # Если разметка HTML была отклонена Telegram, отправляем обычным текстом без тегов!
         if parse_mode is not None:
             clean_text = text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "").replace("<code>", "").replace("</code>", "")
             return send_telegram_message(bot_token, chat_id, clean_text, parse_mode=None)
@@ -643,7 +658,8 @@ def telegram_get_updates(bot_token, offset=None):
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode("utf-8"))
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Ошибка getUpdates в Telegram: {e}")
         return None
 
 # --- Setup Wizard ---
@@ -664,6 +680,8 @@ def run_setup():
 
     print("\n2. Отправьте любое сообщение вашему боту в Telegram.")
     print("   Ожидание сообщения для автоматического получения Chat ID...")
+
+    delete_telegram_webhook(config["bot_token"])
 
     offset = None
     chat_id = None
@@ -822,7 +840,13 @@ def run_daemon():
         sys.exit(1)
 
     print("🚀 Запуск фонового демона мониторинга (Multi-Account & Coolify) и Telegram-бота...")
+    print(f"   Bot Token: {'Настроен' if bot_token else 'ОТСУТСТВУЕТ'}")
+    print(f"   Chat ID: {chat_id if chat_id else 'ОТСУТСТВУЕТ'}")
+    print(f"   Загружено аккаунтов: {len(get_active_accounts(config))}")
     print(f"   Частота проверки: каждые {config.get('check_interval_minutes', 5)} мин. Часовой пояс: UTC+2.")
+
+    # Удаляем старые вебхуки для работы через getUpdates
+    delete_telegram_webhook(bot_token)
 
     send_telegram_message(
         bot_token, chat_id,
@@ -843,6 +867,7 @@ def run_daemon():
         if now - last_check_time >= check_interval:
             last_check_time = now
             try:
+                print("🔄 Периодическая автопроверка лимитов всех аккаунтов...")
                 results = fetch_all_accounts_usage(config)
 
                 for item in results:
@@ -897,19 +922,24 @@ def run_daemon():
                 for up in updates["result"]:
                     offset = up["update_id"] + 1
                     if "message" in up and "text" in up["message"]:
-                        text = up["message"]["text"].strip().lower()
+                        raw_text = up["message"]["text"].strip()
+                        text = raw_text.lower()
                         msg_chat_id = str(up["message"]["chat"]["id"])
 
-                        if text in ["/status", "/check", "статус", "лимиты"]:
+                        print(f"📩 [Telegram] Получено сообщение от chat_id={msg_chat_id}: '{raw_text}'")
+
+                        if text.startswith("/status") or text.startswith("/check") or "статус" in text or "лимиты" in text:
                             send_chat_action(bot_token, msg_chat_id, "typing")
                             try:
                                 results = fetch_all_accounts_usage(config)
                                 report = format_status_report(results)
-                                send_telegram_message(bot_token, msg_chat_id, report)
+                                sent = send_telegram_message(bot_token, msg_chat_id, report)
+                                print(f"📤 [Telegram] Ответ на /status отправлен: {'Успешно' if sent else 'Ошибка'}")
                             except Exception as err:
+                                print(f"❌ Ошибка получения лимитов для /status: {err}")
                                 send_telegram_message(bot_token, msg_chat_id, f"❌ <i>Ошибка получения лимитов: {escape_html(err)}</i>")
 
-                        elif text in ["/start", "/help", "помощь"]:
+                        elif text.startswith("/start") or text.startswith("/help") or "помощь" in text:
                             help_text = (
                                 "🤖 <b>Claude Code Limits Checker (Coolify / Docker)</b>\n\n"
                                 "Команды:\n"
