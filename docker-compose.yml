@@ -7,7 +7,14 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
+      # Обязательно на volume: здесь хранятся ротируемые refresh-токены.
+      # Без персистентного STATE_FILE аккаунты умирают при перезапуске.
+      - STATE_FILE=/data/state.json
       # Вы можете вставить CONFIG_JSON прямо сюда в Coolify:
       # - CONFIG_JSON={"bot_token":"...","chat_id":"...","accounts":[...]}
     volumes:
       - ./config.json:/app/config.json
+      - claude_checker_data:/data
+
+volumes:
+  claude_checker_data:

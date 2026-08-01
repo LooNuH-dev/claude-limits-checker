@@ -1,6 +1,8 @@
 # Secrets & Configurations
 config.json
 config.export.json
+state.json
+state.json.tmp
 .env
 .env.*
 

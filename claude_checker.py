@@ -18,15 +18,26 @@ import urllib.parse
 import urllib.error
 import subprocess
 import argparse
+import threading
 from datetime import datetime, timezone, timedelta
 
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(line_buffering=True)
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+
+# Изменяемое состояние (ротируемые токены, флаги лимитов) живёт ОТДЕЛЬНО от config.json,
+# потому что в Coolify/Docker конфиг приходит из ENV и перекрывает файл при каждом старте.
+# Путь переопределяется через ENV STATE_FILE — в контейнере укажите его на volume.
+STATE_FILE = os.environ.get("STATE_FILE") or os.path.join(BASE_DIR, "state.json")
+
 DEFAULT_KEYCHAIN_SERVICE = "Claude Code-credentials"
 API_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
-TOKEN_REFRESH_URL = "https://platform.claude.com/v1/oauth/token"
+TOKEN_REFRESH_URLS = [
+    "https://console.anthropic.com/v1/oauth/token",
+    "https://platform.claude.com/v1/oauth/token",
+]
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 USER_AGENT = "claude-code/0.2.29"
 
@@ -71,7 +82,11 @@ def load_config():
             if (raw_val.startswith("'") and raw_val.endswith("'")) or (raw_val.startswith('"') and raw_val.endswith('"')):
                 raw_val = raw_val[1:-1].strip()
             parsed = json.loads(raw_val)
+            # accounts сливаем по ключу, а не затираем: иначе аккаунты из файла пропадают
+            parsed_accounts = parsed.pop("accounts", None)
             cfg.update(parsed)
+            if parsed_accounts is not None:
+                cfg["accounts"] = merge_accounts(cfg.get("accounts", []), parsed_accounts)
         except Exception as e:
             print(f"⚠️ Ошибка разбора CONFIG_JSON из ENV: {e}")
 
@@ -88,7 +103,7 @@ def load_config():
     env_accounts = os.environ.get("ACCOUNTS_JSON")
     if env_accounts:
         try:
-            cfg["accounts"] = json.loads(env_accounts)
+            cfg["accounts"] = merge_accounts(cfg.get("accounts", []), json.loads(env_accounts))
         except Exception as e:
             print(f"⚠️ Ошибка разбора ACCOUNTS_JSON из ENV: {e}")
 
@@ -96,6 +111,30 @@ def load_config():
         cfg["accounts"] = []
 
     return cfg
+
+def account_key(account):
+    """Стабильный идентификатор аккаунта для state-файла и merge."""
+    return str(
+        account.get("id")
+        or account.get("keychain_service")
+        or account.get("name")
+        or ""
+    )
+
+def merge_accounts(base, incoming):
+    """Сливает списки аккаунтов по account_key; incoming имеет приоритет по полям."""
+    merged = []
+    by_key = {}
+    for acc in list(base) + list(incoming):
+        key = account_key(acc)
+        if key and key in by_key:
+            by_key[key].update(acc)
+        else:
+            copy = dict(acc)
+            merged.append(copy)
+            if key:
+                by_key[key] = copy
+    return merged
 
 def save_config(config):
     if os.path.exists(CONFIG_FILE) and os.path.isdir(CONFIG_FILE):
@@ -105,6 +144,84 @@ def save_config(config):
             json.dump(config, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+# --- Persistent State (ротируемые токены + флаги лимитов) ---
+
+_state_lock = threading.Lock()
+
+def load_state():
+    if os.path.exists(STATE_FILE) and os.path.isfile(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    data.setdefault("tokens", {})
+                    data.setdefault("account_states", {})
+                    return data
+        except (IsADirectoryError, OSError, json.JSONDecodeError) as e:
+            print(f"⚠️ Не удалось прочитать state-файл {STATE_FILE}: {e}")
+    return {"tokens": {}, "account_states": {}}
+
+def save_state(state):
+    """Атомарная запись: обрыв на середине не должен убить refresh-токены."""
+    if os.path.exists(STATE_FILE) and os.path.isdir(STATE_FILE):
+        print(f"⚠️ STATE_FILE указывает на директорию: {STATE_FILE}")
+        return False
+    tmp_path = f"{STATE_FILE}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, STATE_FILE)
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить state-файл {STATE_FILE}: {e}")
+        return False
+
+def store_tokens(acc_id, access_token, refresh_token, source_refresh=None):
+    """Сохраняет ротированную пару токенов. Без этого аккаунт умирает при рестарте.
+
+    source_refresh — токен из конфига, от которого пошла цепочка ротаций.
+    По нему определяем, что администратор залил свежий экспорт, и state устарел.
+    """
+    if not acc_id:
+        return
+    with _state_lock:
+        state = load_state()
+        entry = state.setdefault("tokens", {}).get(acc_id) or {}
+        entry.update({
+            "access_token": access_token or "",
+            "refresh_token": refresh_token or "",
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+        if source_refresh:
+            entry["source_refresh"] = source_refresh
+        state["tokens"][acc_id] = entry
+        ok = save_state(state)
+    if not ok:
+        print(f"❌ ВНИМАНИЕ: новый refresh-токен для '{acc_id}' не сохранён. "
+              f"После рестарта аккаунт потребует повторного экспорта.")
+
+def load_stored_tokens(acc_id, config_refresh=None):
+    """Возвращает сохранённую пару токенов.
+
+    Если в конфиге лежит другой исходный refresh-токен, чем тот, от которого
+    накопилось состояние, значит конфиг переэкспортировали — state игнорируем,
+    иначе свежий токен так и остался бы затенён мёртвым.
+    """
+    if not acc_id:
+        return None, None
+    entry = load_state().get("tokens", {}).get(acc_id) or {}
+    if not entry:
+        return None, None
+
+    source = entry.get("source_refresh")
+    if config_refresh and source and config_refresh != source:
+        print(f"ℹ️ Обнаружен новый экспорт для '{acc_id}' — использую токены из конфига.")
+        return None, None
+
+    return entry.get("access_token") or None, entry.get("refresh_token") or None
 
 def get_primary_email():
     p = os.path.expanduser("~/.claude.json")
@@ -119,20 +236,37 @@ def get_primary_email():
 
 # --- Keychain (macOS) ---
 
-def discover_keychain_services():
+def discover_keychain_entries():
+    """Возвращает список (service, account).
+
+    Claude Code CLI пишет ровно одну запись: service='Claude Code-credentials',
+    acct=<имя пользователя macOS>. Аккаунты в ней НЕ разделяются — перелогин
+    перезаписывает запись. Поэтому несколько аккаунтов Keychain-ом не отследить;
+    второй и последующие нужно заводить как type='token' (см. команду export).
+    """
     if not IS_MACOS:
         return []
-    services = []
+
+    entries = []
     try:
         res = subprocess.run(["security", "dump-keychain"], capture_output=True, text=True, errors="ignore")
-        matches = re.findall(r'\"svce\"<blob>=\"([^\"]*Claude Code-credentials[^\"]*)\"', res.stdout)
-        services = sorted(list(set(matches)))
+        # acct и svce идут в одном блоке атрибутов; разбираем поэлементно
+        for block in res.stdout.split("keychain: "):
+            svce = re.search(r'"svce"<blob>="([^"]*Claude Code-credentials[^"]*)"', block)
+            if not svce:
+                continue
+            acct = re.search(r'"acct"<blob>="([^"]*)"', block)
+            entries.append((svce.group(1), acct.group(1) if acct else None))
+        entries = sorted(set(entries))
     except Exception:
         pass
 
-    if not services and is_keychain_service_exists(DEFAULT_KEYCHAIN_SERVICE):
-        services = [DEFAULT_KEYCHAIN_SERVICE]
-    return services
+    if not entries and is_keychain_service_exists(DEFAULT_KEYCHAIN_SERVICE):
+        entries = [(DEFAULT_KEYCHAIN_SERVICE, None)]
+    return entries
+
+def discover_keychain_services():
+    return sorted({svc for svc, _acct in discover_keychain_entries()})
 
 def is_keychain_service_exists(service_name):
     if not IS_MACOS:
@@ -143,12 +277,18 @@ def is_keychain_service_exists(service_name):
     except Exception:
         return False
 
-def get_keychain_credentials(service_name=DEFAULT_KEYCHAIN_SERVICE):
+def _keychain_args(service_name, account_name):
+    args = ["-s", service_name]
+    if account_name:
+        args += ["-a", account_name]
+    return args
+
+def get_keychain_credentials(service_name=DEFAULT_KEYCHAIN_SERVICE, account_name=None):
     if not IS_MACOS:
         raise RuntimeError("Keychain доступен только на macOS")
     try:
         res = subprocess.run(
-            ["security", "find-generic-password", "-s", service_name, "-w"],
+            ["security", "find-generic-password"] + _keychain_args(service_name, account_name) + ["-w"],
             capture_output=True, text=True, check=True
         )
         data = json.loads(res.stdout.strip())
@@ -157,25 +297,42 @@ def get_keychain_credentials(service_name=DEFAULT_KEYCHAIN_SERVICE):
     except Exception as e:
         raise RuntimeError(f"Не удалось прочитать Keychain ({service_name}): {e}")
 
-def update_keychain_credentials(service_name, new_access_token, new_refresh_token):
+def update_keychain_credentials(service_name, new_access_token, new_refresh_token, account_name=None):
+    """Обновляет запись строго на месте.
+
+    -a обязателен при записи: без него add-generic-password -U может попасть
+    не в ту запись, если в связке есть несколько элементов с этим service.
+    """
     if not IS_MACOS:
         return
     try:
         res = subprocess.run(
-            ["security", "find-generic-password", "-s", service_name, "-w"],
+            ["security", "find-generic-password"] + _keychain_args(service_name, account_name) + ["-w"],
             capture_output=True, text=True, check=True
         )
         data = json.loads(res.stdout.strip())
-        if "claudeAiOauth" in data:
-            data["claudeAiOauth"]["accessToken"] = new_access_token
-            data["claudeAiOauth"]["refreshToken"] = new_refresh_token
-            new_json_str = json.dumps(data)
-            subprocess.run(
-                ["security", "add-generic-password", "-U", "-s", service_name, "-w", new_json_str],
-                capture_output=True, check=True
+        if "claudeAiOauth" not in data:
+            return
+
+        if not account_name:
+            # определяем acct существующей записи, чтобы писать точечно
+            info = subprocess.run(
+                ["security", "find-generic-password", "-s", service_name],
+                capture_output=True, text=True
             )
-    except Exception:
-        pass
+            m = re.search(r'"acct"<blob>="([^"]*)"', info.stdout)
+            account_name = m.group(1) if m else None
+
+        data["claudeAiOauth"]["accessToken"] = new_access_token
+        data["claudeAiOauth"]["refreshToken"] = new_refresh_token
+        subprocess.run(
+            ["security", "add-generic-password", "-U"]
+            + _keychain_args(service_name, account_name)
+            + ["-w", json.dumps(data)],
+            capture_output=True, check=True
+        )
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить Keychain ({service_name}): {e}")
 
 def refresh_claude_cli_token():
     if not IS_MACOS:
@@ -201,32 +358,55 @@ def refresh_oauth_token_direct(refresh_token):
     }
 
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        TOKEN_REFRESH_URL,
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT
-        }
-    )
+    last_err = None
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            res_json = json.loads(resp.read().decode("utf-8"))
-            new_access_token = res_json.get("access_token")
-            new_refresh_token = res_json.get("refresh_token") or refresh_token
-            return new_access_token, new_refresh_token
-    except urllib.error.HTTPError as e:
-        err_msg = ""
+    for url in TOKEN_REFRESH_URLS:
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": USER_AGENT
+            }
+        )
+
         try:
-            err_body = json.loads(e.read().decode("utf-8"))
-            err_msg = err_body.get("error", {}).get("message") or err_body.get("error") or str(err_body)
-        except Exception:
-            pass
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                res_json = json.loads(resp.read().decode("utf-8"))
+                new_access_token = res_json.get("access_token")
+                if not new_access_token:
+                    raise RuntimeError("Ответ OAuth не содержит access_token")
+                new_refresh_token = res_json.get("refresh_token") or refresh_token
+                return new_access_token, new_refresh_token
+        except urllib.error.HTTPError as e:
+            err_msg = ""
+            raw_body = ""
+            try:
+                raw_body = e.read().decode("utf-8", errors="replace").strip()
+                err_body = json.loads(raw_body)
+                err_msg = err_body.get("error", {}).get("message") or err_body.get("error") or str(err_body)
+            except Exception:
+                # тело не JSON — показываем как есть, иначе причина 400 остаётся невидимой
+                err_msg = raw_body[:300]
 
-        if e.code == 400 or "invalid_grant" in str(err_msg).lower():
-            raise RuntimeError("Сессия истекла (invalid_grant). Требуется повторный вход в аккаунт.")
-        raise RuntimeError(f"HTTP {e.code}: {err_msg or e.reason}")
+            # invalid_grant — токен мёртв, другой эндпоинт не поможет
+            if "invalid_grant" in str(err_msg).lower():
+                raise RuntimeError("Сессия истекла (invalid_grant). Требуется повторный вход в аккаунт.")
+            # Эндпоинт мог переехать: 404/405, а равно и невнятный 400 без
+            # диагностики — повод попробовать следующий адрес, а не сдаваться.
+            if e.code in (400, 404, 405):
+                last_err = RuntimeError(f"HTTP {e.code} на {url}: {err_msg or 'без деталей'}")
+                continue
+            raise RuntimeError(f"HTTP {e.code}: {err_msg or e.reason}")
+        except urllib.error.URLError as e:
+            last_err = RuntimeError(f"Сеть недоступна при обращении к {url}: {e.reason}")
+            continue
+        except (TimeoutError, json.JSONDecodeError) as e:
+            last_err = RuntimeError(f"Некорректный ответ от {url}: {e}")
+            continue
+
+    raise last_err or RuntimeError("Не удалось обновить OAuth-токен")
 
 # --- Account Usage Fetcher ---
 
@@ -235,12 +415,12 @@ def get_active_accounts(config):
     if not IS_MACOS or not config.get("auto_discover_keychain", True):
         return configured
 
-    discovered_services = discover_keychain_services()
+    discovered = discover_keychain_entries()
     accounts = list(configured)
     existing_services = {a.get("keychain_service") for a in configured if a.get("type") == "keychain"}
     primary_email = get_primary_email()
 
-    for svc in discovered_services:
+    for svc, acct in discovered:
         if svc not in existing_services:
             if svc == DEFAULT_KEYCHAIN_SERVICE:
                 label = primary_email if primary_email else "Основной аккаунт"
@@ -251,7 +431,8 @@ def get_active_accounts(config):
                 "id": svc,
                 "name": label,
                 "type": "keychain",
-                "keychain_service": svc
+                "keychain_service": svc,
+                "keychain_account": acct
             })
 
     if not accounts and IS_MACOS:
@@ -295,7 +476,8 @@ def fetch_account_usage(account, config):
     try:
         if acc_type == "keychain" and IS_MACOS:
             svc = account.get("keychain_service", DEFAULT_KEYCHAIN_SERVICE)
-            token, rf_token, _ = get_keychain_credentials(svc)
+            acct = account.get("keychain_account")
+            token, rf_token, _ = get_keychain_credentials(svc, acct)
 
             if not token and not rf_token:
                 return None, f"Токен отсутствует в Keychain ({svc}). Запустите 'claude auth login'"
@@ -310,11 +492,11 @@ def fetch_account_usage(account, config):
                     if rf_token:
                         try:
                             new_acc, new_rf = refresh_oauth_token_direct(rf_token)
-                            update_keychain_credentials(svc, new_acc, new_rf)
+                            update_keychain_credentials(svc, new_acc, new_rf, acct)
                             data = fetch_usage_for_token(new_acc)
                             return data, None
-                        except Exception:
-                            pass
+                        except Exception as refresh_err:
+                            print(f"⚠️ Обновление токена Keychain ({svc}) не удалось: {refresh_err}")
                     if svc == DEFAULT_KEYCHAIN_SERVICE:
                         token = refresh_claude_cli_token()
                         if token:
@@ -323,8 +505,14 @@ def fetch_account_usage(account, config):
                 raise e
 
         elif acc_type == "token":
-            token = account.get("access_token")
-            rf_token = account.get("refresh_token")
+            acc_id = account_key(account)
+            config_refresh = account.get("refresh_token")
+
+            # Токены из state-файла новее конфига: OAuth ротирует refresh-токен
+            # при каждом обновлении, а config.json/CONFIG_JSON остаются со старым.
+            stored_access, stored_refresh = load_stored_tokens(acc_id, config_refresh)
+            token = stored_access or account.get("access_token")
+            rf_token = stored_refresh or config_refresh
 
             if not token and not rf_token:
                 return None, "Токены отсутствуют в конфиге. Выполните 'claude auth login' и повторите export"
@@ -342,14 +530,21 @@ def fetch_account_usage(account, config):
             if rf_token:
                 try:
                     new_acc, new_rf = refresh_oauth_token_direct(rf_token)
-                    account["access_token"] = new_acc
-                    account["refresh_token"] = new_rf
-                    save_config(config)
-
-                    data = fetch_usage_for_token(new_acc)
-                    return data, None
                 except Exception as refresh_err:
-                    return None, f"{refresh_err}"
+                    # Если протух токен из state — пробуем исходный из конфига один раз
+                    if stored_refresh and config_refresh and config_refresh != rf_token:
+                        try:
+                            new_acc, new_rf = refresh_oauth_token_direct(config_refresh)
+                        except Exception as e2:
+                            return None, f"{e2}"
+                    else:
+                        return None, f"{refresh_err}"
+
+                account["access_token"] = new_acc
+                store_tokens(acc_id, new_acc, new_rf, source_refresh=config_refresh)
+
+                data = fetch_usage_for_token(new_acc)
+                return data, None
 
         else:
             return None, f"Неподдерживаемый тип аккаунта ({acc_type}) для этой ОС"
@@ -364,19 +559,39 @@ def fetch_account_usage(account, config):
         return None, str(e)
 
 def fetch_all_accounts_usage(config):
-    accounts = get_active_accounts(config)
-    results = []
-    for idx, acc in enumerate(accounts):
-        if idx > 0:
-            time.sleep(2.0)
+    """Опрашивает аккаунты параллельно.
 
+    Раньше здесь была последовательная пауза 2 с на аккаунт — вместе с таймаутами
+    и ретраями это блокировало ответ бота на десятки секунд. Аккаунты независимы,
+    поэтому идут одновременно; от 429 защищает retry-логика в fetch_usage_for_token.
+    """
+    accounts = get_active_accounts(config)
+    if not accounts:
+        return []
+
+    results = [None] * len(accounts)
+
+    def worker(idx, acc):
         usage, err = fetch_account_usage(acc, config)
-        results.append({
-            "account": acc,
-            "usage": usage,
-            "error": err
-        })
-    return results
+        results[idx] = {"account": acc, "usage": usage, "error": err}
+
+    threads = []
+    for idx, acc in enumerate(accounts):
+        t = threading.Thread(target=worker, args=(idx, acc), daemon=True)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join(timeout=60)
+
+    return [
+        r if r is not None else {
+            "account": accounts[i],
+            "usage": None,
+            "error": "Таймаут запроса к API (60 с)"
+        }
+        for i, r in enumerate(results)
+    ]
 
 # --- Export Config for Coolify & Remote VPS ---
 
@@ -407,6 +622,9 @@ def export_config():
                         label = f"Аккаунт ({svc.replace('Claude Code-credentials-', '')})"
 
                     export_accounts.append({
+                        # стабильный id нужен state-файлу, чтобы ротированные
+                        # токены не терялись при переименовании аккаунта
+                        "id": svc,
                         "name": label,
                         "type": "token",
                         "access_token": acc_token or "",
@@ -425,11 +643,15 @@ def export_config():
 
         if acc.get("type") == "token" and (acc_token or rf_token):
             if rf_token not in seen_refresh_tokens:
+                # если для аккаунта уже есть ротированные токены — экспортируем их,
+                # иначе на сервер уедет заведомо протухшая пара
+                st_access, st_refresh = load_stored_tokens(account_key(acc))
                 export_accounts.append({
+                    "id": account_key(acc) or f"token_{len(export_accounts)}",
                     "name": acc.get("name", "Доп. аккаунт"),
                     "type": "token",
-                    "access_token": acc_token,
-                    "refresh_token": rf_token,
+                    "access_token": st_access or acc_token,
+                    "refresh_token": st_refresh or rf_token,
                     "scopes": acc.get("scopes", ["user:inference", "user:profile"])
                 })
                 if rf_token:
@@ -573,7 +795,7 @@ def format_console_report(results):
         lines.append(f"  • 5-часовой лимит: {p5:.1f}%")
         if p5 >= 100:
             lines.append(f"    --> ЛИМИТ ДОСТИГНУТ! Сброс через: {format_countdown(reset5_dt)} (в {format_local_time(reset5_dt)})")
-        else:
+        elif reset5_dt:
             lines.append(f"    --> Сброс в: {format_local_time(reset5_dt)} (через {format_countdown(reset5_dt)})")
 
         seven_d = data.get("seven_day", {})
@@ -581,7 +803,8 @@ def format_console_report(results):
         reset7_dt = parse_iso_time(seven_d.get("resets_at"))
 
         lines.append(f"  • 7-дневный лимит: {p7:.1f}%")
-        lines.append(f"    --> Сброс в: {format_local_time(reset7_dt)} (через {format_countdown(reset7_dt)})")
+        if reset7_dt:
+            lines.append(f"    --> Сброс в: {format_local_time(reset7_dt)} (через {format_countdown(reset7_dt)})")
 
         extra = data.get("extra_usage") or {}
         if extra.get("is_enabled"):
@@ -619,44 +842,82 @@ def send_chat_action(bot_token, chat_id, action="typing"):
     except Exception:
         pass
 
-def send_telegram_message(bot_token, chat_id, text, parse_mode="HTML"):
-    if not bot_token or not chat_id:
+def strip_html_markup(text):
+    clean = re.sub(r"</?(b|i|code|pre|u|s|a)(\s[^>]*)?>", "", text)
+    return (clean.replace("&lt;", "<")
+                 .replace("&gt;", ">")
+                 .replace("&quot;", '"')
+                 .replace("&#x27;", "'")
+                 .replace("&amp;", "&"))
+
+def telegram_call(bot_token, method, payload, parse_mode="HTML", timeout=10):
+    """Общий вызов Bot API. Возвращает поле result или None.
+
+    На 400 один раз повторяет запрос без HTML-разметки: это единственный код,
+    при котором виновата разметка. На 429/5xx повтор только вредит.
+    """
+    if not bot_token or not payload.get("chat_id"):
         print("⚠️ Bot token или Chat ID не настроены!")
-        return False
+        return None
 
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "disable_web_page_preview": True
-    }
-    if parse_mode:
-        payload["parse_mode"] = parse_mode
+    body = dict(payload)
+    if parse_mode and "text" in body:
+        body["parse_mode"] = parse_mode
 
-    data = json.dumps(payload).encode("utf-8")
+    url = f"https://api.telegram.org/bot{bot_token}/{method}"
+    data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
 
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             res_json = json.loads(resp.read().decode("utf-8"))
-            return res_json.get("ok", False)
+            return res_json.get("result") if res_json.get("ok") else None
     except urllib.error.HTTPError as e:
-        if parse_mode is not None:
-            clean_text = text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "").replace("<code>", "").replace("</code>", "")
-            return send_telegram_message(bot_token, chat_id, clean_text, parse_mode=None)
-        print(f"⚠️ Ошибка отправки сообщения в Telegram: {e}")
-        return False
+        if e.code == 400 and parse_mode is not None and "text" in payload:
+            retry = dict(payload)
+            retry["text"] = strip_html_markup(payload["text"])
+            return telegram_call(bot_token, method, retry, parse_mode=None, timeout=timeout)
+        print(f"⚠️ Ошибка Telegram {method} (HTTP {e.code}): {e}")
+        return None
     except Exception as e:
-        print(f"⚠️ Ошибка отправки сообщения в Telegram: {e}")
-        return False
+        print(f"⚠️ Ошибка Telegram {method}: {e}")
+        return None
 
-def telegram_get_updates(bot_token, offset=None):
-    url = f"https://api.telegram.org/bot{bot_token}/getUpdates?timeout=5"
+def send_telegram_message(bot_token, chat_id, text, parse_mode="HTML"):
+    return send_telegram_message_id(bot_token, chat_id, text, parse_mode) is not None
+
+def send_telegram_message_id(bot_token, chat_id, text, parse_mode="HTML"):
+    """Как send_telegram_message, но возвращает message_id — нужен для редактирования."""
+    result = telegram_call(bot_token, "sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "disable_web_page_preview": True
+    }, parse_mode)
+    return result.get("message_id") if isinstance(result, dict) else None
+
+def edit_telegram_message(bot_token, chat_id, message_id, text, parse_mode="HTML"):
+    if not message_id:
+        return False
+    result = telegram_call(bot_token, "editMessageText", {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "disable_web_page_preview": True
+    }, parse_mode)
+    return result is not None
+
+def telegram_get_updates(bot_token, offset=None, long_poll=25):
+    """Long polling: Telegram держит соединение до появления апдейта.
+
+    Ответ приходит мгновенно, а не через фиксированный sleep, как раньше.
+    HTTP-таймаут всегда больше серверного, иначе рвём соединение сами.
+    """
+    url = f"https://api.telegram.org/bot{bot_token}/getUpdates?timeout={long_poll}"
     if offset:
         url += f"&offset={offset}"
     req = urllib.request.Request(url)
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=long_poll + 10) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
         print(f"⚠️ Ошибка getUpdates в Telegram: {e}")
@@ -688,7 +949,7 @@ def run_setup():
     start_time = time.time()
 
     while time.time() - start_time < 60:
-        updates = telegram_get_updates(config["bot_token"], offset)
+        updates = telegram_get_updates(config["bot_token"], offset, long_poll=5)
         if updates and updates.get("ok") and updates.get("result"):
             for up in updates["result"]:
                 offset = up["update_id"] + 1
@@ -830,6 +1091,190 @@ def manage_accounts():
 
 # --- Bot & Monitor Daemon ---
 
+HELP_TEXT = (
+    "🤖 <b>Claude Code Limits Checker (Coolify / Docker)</b>\n\n"
+    "Команды:\n"
+    "• <code>/status</code> или <code>/check</code> — проверить текущие лимиты всех аккаунтов\n"
+    "• <code>/help</code> — справка\n\n"
+    "Бот автоматически проверяет ваши аккаунты и уведомляет, когда лимиты превышены или сбросились!"
+)
+
+def parse_command(raw_text):
+    """Разбирает первое слово как команду. Учитывает формат /status@MyBot.
+
+    Раньше использовалась проверка вида "статус" in text — она срабатывала
+    на подстроку в любом сообщении.
+    """
+    if not raw_text:
+        return None
+    first = raw_text.strip().split()[0].lower()
+    if first.startswith("/"):
+        first = first.split("@", 1)[0]
+        return first
+    if first in ("статус", "лимиты", "лимит"):
+        return "/status"
+    if first in ("помощь", "справка", "старт"):
+        return "/help"
+    return None
+
+def allowed_chat_ids(config):
+    """Белый список чатов. Без него бот отвечает кому угодно, кто его нашёл."""
+    ids = set()
+    primary = config.get("chat_id")
+    if primary:
+        ids.add(str(primary).strip())
+    extra = config.get("allowed_chat_ids") or os.environ.get("ALLOWED_CHAT_IDS", "")
+    if isinstance(extra, str):
+        extra = [x for x in re.split(r"[,\s]+", extra) if x]
+    for x in extra or []:
+        ids.add(str(x).strip())
+    return ids
+
+def monitor_loop(config, bot_token, chat_id, stop_event):
+    """Периодическая проверка лимитов в отдельном потоке.
+
+    Вынесено из главного цикла: раньше долгая проверка (таймауты, ретраи 429,
+    refresh) блокировала чтение команд, и бот молчал десятки секунд.
+    """
+    check_interval = max(60, config.get("check_interval_minutes", 5) * 60)
+
+    with _state_lock:
+        account_states = dict(load_state().get("account_states", {}))
+
+    # Даём боту принять команды до первой тяжёлой проверки
+    if stop_event.wait(5):
+        return
+
+    while not stop_event.is_set():
+        try:
+            print("🔄 Периодическая автопроверка лимитов всех аккаунтов...")
+            results = fetch_all_accounts_usage(config)
+
+            for item in results:
+                acc = item["account"]
+                acc_id = account_key(acc)
+                acc_name = escape_html(acc.get("name", "Аккаунт"))
+                data = item["usage"]
+
+                if not data:
+                    if item.get("error"):
+                        print(f"⚠️ [{acc.get('name')}] {item['error']}")
+                    continue
+
+                five_h = data.get("five_hour", {})
+                p5 = five_h.get("utilization", 0.0) or 0.0
+                reset5_dt = parse_iso_time(five_h.get("resets_at"))
+
+                was_limited = account_states.get(acc_id, False)
+                is_limited = p5 >= 100.0
+
+                if is_limited and not was_limited and config.get("notify_on_limit_reached", True):
+                    send_telegram_message(bot_token, chat_id, (
+                        f"⚠️ <b>[{acc_name}] Достигнут 100% лимит Claude Code!</b>\n\n"
+                        f"⏳ Сброс ожидается через: <b>{format_countdown(reset5_dt)}</b> (в {format_local_time(reset5_dt)})\n\n"
+                        "🔔 Я пришлю уведомление, как только лимит сбросится!"
+                    ))
+                elif not is_limited and was_limited and config.get("notify_on_reset", True):
+                    send_telegram_message(bot_token, chat_id, (
+                        f"🎉 <b>[{acc_name}] Лимиты Claude Code сбросились!</b>\n\n"
+                        f"🟢 5-часовой лимит доступен (использовано: <code>{p5:.1f}%</code>).\n"
+                        "Вы можете продолжать работу!"
+                    ))
+
+                account_states[acc_id] = is_limited
+
+            # Состояние в state-файле, а не в config.json: иначе в ENV-режиме
+            # оно теряется при рестарте и уведомления дублируются.
+            with _state_lock:
+                state = load_state()
+                state["account_states"] = account_states
+                save_state(state)
+
+        except Exception as e:
+            print(f"⚠️ Ошибка проверки лимитов: {e}")
+
+        stop_event.wait(check_interval)
+
+# Индикатор "печатает" в Telegram гаснет через ~5 с, поэтому его нужно обновлять.
+TYPING_REFRESH_SEC = 4
+# Пороги, на которых пользователю сообщается, что запрос всё ещё выполняется.
+PROGRESS_STEPS_SEC = (6, 15, 30)
+
+def waiting_indicator(bot_token, chat_id, message_id, stop_event, started_at):
+    """Держит "печатает" живым и обновляет сообщение-заглушку, если ответ затянулся.
+
+    Без этого при медленном ответе Anthropic (или ретраях на 429) пользователь
+    видит тишину и не понимает, принял бот команду или нет.
+    """
+    remaining = list(PROGRESS_STEPS_SEC)
+    next_typing = started_at
+
+    while not stop_event.is_set():
+        now = time.time()
+
+        if now >= next_typing:
+            send_chat_action(bot_token, chat_id, "typing")
+            next_typing = now + TYPING_REFRESH_SEC
+
+        elapsed = now - started_at
+        if remaining and elapsed >= remaining[0]:
+            threshold = remaining.pop(0)
+            edit_telegram_message(
+                bot_token, chat_id, message_id,
+                f"⏳ <i>Опрашиваю аккаунты… ({int(threshold)}+ с)</i>\n"
+                f"<i>Anthropic отвечает медленнее обычного, жду.</i>"
+            )
+            continue
+
+        # Просыпаемся ровно к ближайшему событию, а не по фиксированному тику:
+        # иначе порог в 6 с срабатывал бы только на 8-й секунде.
+        wake_at = next_typing
+        if remaining:
+            wake_at = min(wake_at, started_at + remaining[0])
+        if stop_event.wait(max(0.05, wake_at - time.time())):
+            return
+
+def handle_command(config, bot_token, cmd, msg_chat_id):
+    if cmd in ("/status", "/check"):
+        started_at = time.time()
+        send_chat_action(bot_token, msg_chat_id, "typing")
+
+        # Заглушка отправляется сразу: подтверждает приём команды за доли секунды,
+        # а в конце заменяется готовым отчётом — вместо второго сообщения.
+        placeholder_id = send_telegram_message_id(
+            bot_token, msg_chat_id, "⏳ <i>Проверяю лимиты аккаунтов…</i>"
+        )
+
+        stop_event = threading.Event()
+        indicator = threading.Thread(
+            target=waiting_indicator,
+            args=(bot_token, msg_chat_id, placeholder_id, stop_event, started_at),
+            daemon=True
+        )
+        indicator.start()
+
+        try:
+            results = fetch_all_accounts_usage(config)
+            text = format_status_report(results)
+        except Exception as err:
+            print(f"❌ Ошибка получения лимитов для {cmd}: {err}")
+            text = f"❌ <i>Ошибка получения лимитов: {escape_html(err)}</i>"
+        finally:
+            # Останавливаем индикатор до финальной записи, иначе он может
+            # затереть готовый отчёт своим последним обновлением.
+            stop_event.set()
+            indicator.join(timeout=5)
+
+        elapsed = time.time() - started_at
+        sent = edit_telegram_message(bot_token, msg_chat_id, placeholder_id, text)
+        if not sent:
+            sent = send_telegram_message(bot_token, msg_chat_id, text)
+
+        print(f"📤 [Telegram] Ответ на {cmd} за {elapsed:.1f} с: {'Успешно' if sent else 'Ошибка'}")
+
+    elif cmd in ("/start", "/help"):
+        send_telegram_message(bot_token, msg_chat_id, HELP_TEXT)
+
 def run_daemon():
     config = load_config()
     bot_token = config.get("bot_token")
@@ -839,10 +1284,14 @@ def run_daemon():
         print("❌ Ошибка: Скрипт не настроен! Задайте переменные окружения BOT_TOKEN и CHAT_ID в Coolify или запустите: python3 claude_checker.py setup")
         sys.exit(1)
 
+    allowed = allowed_chat_ids(config)
+
     print("🚀 Запуск фонового демона мониторинга (Multi-Account & Coolify) и Telegram-бота...")
     print(f"   Bot Token: {'Настроен' if bot_token else 'ОТСУТСТВУЕТ'}")
     print(f"   Chat ID: {chat_id if chat_id else 'ОТСУТСТВУЕТ'}")
+    print(f"   Разрешённые чаты: {', '.join(sorted(allowed))}")
     print(f"   Загружено аккаунтов: {len(get_active_accounts(config))}")
+    print(f"   State-файл: {STATE_FILE}")
     print(f"   Частота проверки: каждые {config.get('check_interval_minutes', 5)} мин. Часовой пояс: UTC+2.")
 
     # Удаляем старые вебхуки для работы через getUpdates
@@ -854,104 +1303,55 @@ def run_daemon():
         "Отправьте <code>/status</code> или <code>/check</code> для получения текущего состояния всех аккаунтов."
     )
 
+    stop_event = threading.Event()
+    monitor = threading.Thread(
+        target=monitor_loop,
+        args=(config, bot_token, chat_id, stop_event),
+        daemon=True
+    )
+    monitor.start()
+
     offset = None
-    last_check_time = 0
-    check_interval = config.get("check_interval_minutes", 5) * 60
-
-    account_states = config.get("account_states", {})
-
-    while True:
-        now = time.time()
-
-        # 1. Периодическая проверка лимитов для всех аккаунтов
-        if now - last_check_time >= check_interval:
-            last_check_time = now
+    try:
+        while True:
             try:
-                print("🔄 Периодическая автопроверка лимитов всех аккаунтов...")
-                results = fetch_all_accounts_usage(config)
+                updates = telegram_get_updates(bot_token, offset)
+                if not (updates and updates.get("ok")):
+                    # Ошибка сети/API — короткая пауза, чтобы не долбить в цикле
+                    time.sleep(3)
+                    continue
 
-                for item in results:
-                    acc = item["account"]
-                    acc_id = acc.get("keychain_service") or acc.get("id") or acc.get("name")
-                    acc_name = escape_html(acc.get("name", "Аккаунт"))
-                    data = item["usage"]
-
-                    if not data:
+                for up in updates.get("result", []):
+                    offset = up["update_id"] + 1
+                    msg = up.get("message") or up.get("edited_message")
+                    if not msg or "text" not in msg:
                         continue
 
-                    five_h = data.get("five_hour", {})
-                    p5 = five_h.get("utilization", 0.0) or 0.0
-                    reset5_dt = parse_iso_time(five_h.get("resets_at"))
+                    raw_text = msg["text"].strip()
+                    msg_chat_id = str(msg["chat"]["id"])
 
-                    was_limited = account_states.get(acc_id, False)
-                    is_limited = p5 >= 100.0
+                    if msg_chat_id not in allowed:
+                        print(f"🚫 [Telegram] Игнорирую сообщение от постороннего chat_id={msg_chat_id}")
+                        continue
 
-                    # Переход в состояние "Лимит 100%"
-                    if is_limited and not was_limited and config.get("notify_on_limit_reached", True):
-                        msg = (
-                            f"⚠️ <b>[{acc_name}] Достигнут 100% лимит Claude Code!</b>\n\n"
-                            f"⏳ Сброс ожидается через: <b>{format_countdown(reset5_dt)}</b> (в {format_local_time(reset5_dt)})\n\n"
-                            "🔔 Я пришлю уведомление, как только лимит сбросится!"
-                        )
-                        send_telegram_message(bot_token, chat_id, msg)
-                        account_states[acc_id] = True
+                    print(f"📩 [Telegram] Получено сообщение от chat_id={msg_chat_id}: '{raw_text}'")
 
-                    # Переход в состояние "Лимит Сбросился"
-                    elif not is_limited and was_limited and config.get("notify_on_reset", True):
-                        msg = (
-                            f"🎉 <b>[{acc_name}] Лимиты Claude Code сбросились!</b>\n\n"
-                            f"🟢 5-часовой лимит доступен (использовано: <code>{p5:.1f}%</code>).\n"
-                            "Вы можете продолжать работу!"
-                        )
-                        send_telegram_message(bot_token, chat_id, msg)
-                        account_states[acc_id] = False
-
-                    else:
-                        account_states[acc_id] = is_limited
-
-                config["account_states"] = account_states
-                save_config(config)
+                    cmd = parse_command(raw_text)
+                    if cmd:
+                        # Каждая команда в своём потоке: долгий /status не блокирует
+                        # приём следующих сообщений
+                        threading.Thread(
+                            target=handle_command,
+                            args=(config, bot_token, cmd, msg_chat_id),
+                            daemon=True
+                        ).start()
 
             except Exception as e:
-                print(f"⚠️ Ошибка проверки лимитов: {e}")
-
-        # 2. Обработка команд из Telegram бота
-        try:
-            updates = telegram_get_updates(bot_token, offset)
-            if updates and updates.get("ok") and updates.get("result"):
-                for up in updates["result"]:
-                    offset = up["update_id"] + 1
-                    if "message" in up and "text" in up["message"]:
-                        raw_text = up["message"]["text"].strip()
-                        text = raw_text.lower()
-                        msg_chat_id = str(up["message"]["chat"]["id"])
-
-                        print(f"📩 [Telegram] Получено сообщение от chat_id={msg_chat_id}: '{raw_text}'")
-
-                        if text.startswith("/status") or text.startswith("/check") or "статус" in text or "лимиты" in text:
-                            send_chat_action(bot_token, msg_chat_id, "typing")
-                            try:
-                                results = fetch_all_accounts_usage(config)
-                                report = format_status_report(results)
-                                sent = send_telegram_message(bot_token, msg_chat_id, report)
-                                print(f"📤 [Telegram] Ответ на /status отправлен: {'Успешно' if sent else 'Ошибка'}")
-                            except Exception as err:
-                                print(f"❌ Ошибка получения лимитов для /status: {err}")
-                                send_telegram_message(bot_token, msg_chat_id, f"❌ <i>Ошибка получения лимитов: {escape_html(err)}</i>")
-
-                        elif text.startswith("/start") or text.startswith("/help") or "помощь" in text:
-                            help_text = (
-                                "🤖 <b>Claude Code Limits Checker (Coolify / Docker)</b>\n\n"
-                                "Команды:\n"
-                                "• <code>/status</code> или <code>/check</code> — проверить текущие лимиты всех аккаунтов\n"
-                                "• <code>/help</code> — справка\n\n"
-                                "Бот автоматически проверяет ваши аккаунты и уведомляет, когда лимиты превышены или сбросились!"
-                            )
-                            send_telegram_message(bot_token, msg_chat_id, help_text)
-        except Exception as e:
-            print(f"⚠️ Ошибка обработки сообщений Telegram: {e}")
-
-        time.sleep(3)
+                print(f"⚠️ Ошибка обработки сообщений Telegram: {e}")
+                time.sleep(3)
+    except KeyboardInterrupt:
+        print("\n👋 Остановка демона...")
+        stop_event.set()
 
 # --- CLI Entrypoint ---
 

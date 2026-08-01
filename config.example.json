@@ -1,12 +1,14 @@
 {
   "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
   "chat_id": "YOUR_TELEGRAM_CHAT_ID",
+  "allowed_chat_ids": [],
   "check_interval_minutes": 5,
   "notify_on_reset": true,
   "notify_on_limit_reached": true,
   "auto_discover_keychain": true,
   "accounts": [
     {
+      "id": "main",
       "name": "Основной аккаунт",
       "type": "token",
       "access_token": "sk-ant-oat01-YOUR_ACCESS_TOKEN",
