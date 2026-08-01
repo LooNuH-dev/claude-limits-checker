@@ -1353,6 +1353,193 @@ def run_daemon():
         print("\n👋 Остановка демона...")
         stop_event.set()
 
+# --- Diagnostics ---
+
+def mask_token(token):
+    """Показывает только опознавательные края токена — по ним видно тип и различие."""
+    if not token:
+        return "—"
+    if len(token) <= 18:
+        return f"{token[:4]}…({len(token)} симв.)"
+    return f"{token[:14]}…{token[-4:]} ({len(token)} симв.)"
+
+def scan_all_claude_keychain():
+    """Все записи Keychain, где в имени сервиса встречается 'Claude'.
+
+    Основной поиск идёт по маске 'Claude Code-credentials', но клоны клиента
+    могут писать под другим именем — эта функция показывает картину целиком.
+    """
+    if not IS_MACOS:
+        return []
+    found = []
+    try:
+        res = subprocess.run(["security", "dump-keychain"], capture_output=True, text=True, errors="ignore")
+        for block in res.stdout.split("keychain: "):
+            svce = re.search(r'"svce"<blob>="([^"]*[Cc]laude[^"]*)"', block)
+            if not svce:
+                continue
+            acct = re.search(r'"acct"<blob>="([^"]*)"', block)
+            mdat = re.search(r'"mdat"<timedate>=0x[0-9A-F]*\s*"([^"]*)"', block)
+            found.append((svce.group(1), acct.group(1) if acct else None,
+                          mdat.group(1) if mdat else None))
+    except Exception as e:
+        print(f"⚠️ Не удалось просканировать Keychain: {e}")
+    return sorted(set(found))
+
+def scan_credential_files():
+    """Файловые хранилища Claude Code (используются, когда Keychain недоступен)."""
+    candidates = [
+        os.path.expanduser("~/.claude/.credentials.json"),
+        os.path.expanduser("~/.config/claude/.credentials.json"),
+    ]
+    cfg_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cfg_dir:
+        candidates.append(os.path.join(os.path.expanduser(cfg_dir), ".credentials.json"))
+
+    support = os.path.expanduser("~/Library/Application Support")
+    if os.path.isdir(support):
+        for name in os.listdir(support):
+            if "laude" in name:
+                candidates.append(os.path.join(support, name, ".credentials.json"))
+                candidates.append(os.path.join(support, name, "credentials.json"))
+
+    return [p for p in dict.fromkeys(candidates) if os.path.isfile(p)]
+
+def scan_claude_identities():
+    """Конфиги Claude Code и аккаунт в каждом.
+
+    Изоляция аккаунтов делается через CLAUDE_CONFIG_DIR: у каждого свой каталог
+    с .claude.json и своя запись в Keychain. Один каталог = один аккаунт за раз.
+    """
+    paths = [os.path.expanduser("~/.claude.json")]
+    home = os.path.expanduser("~")
+    try:
+        for name in os.listdir(home):
+            if name.startswith(".") and name != ".claude":
+                candidate = os.path.join(home, name, ".claude.json")
+                if os.path.isfile(candidate):
+                    paths.append(candidate)
+    except OSError:
+        pass
+
+    found = []
+    for p in dict.fromkeys(paths):
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            email = (data.get("oauthAccount") or {}).get("emailAddress")
+        except Exception:
+            email = None
+        found.append((p, email, os.path.getmtime(p)))
+    return found
+
+def run_doctor():
+    print("\n🩺 ДИАГНОСТИКА ИСТОЧНИКОВ УЧЁТНЫХ ДАННЫХ")
+    print("=" * 62)
+    print(f"ОС: {platform.system()} | Keychain доступен: {'да' if IS_MACOS else 'нет'}")
+    print(f"State-файл: {STATE_FILE} ({'есть' if os.path.isfile(STATE_FILE) else 'нет'})")
+    print(f"Конфиг: {CONFIG_FILE} ({'есть' if os.path.isfile(CONFIG_FILE) else 'нет'})")
+    print(f"CONFIG_JSON в ENV: {'задан' if os.environ.get('CONFIG_JSON') else 'нет'}")
+
+    if IS_MACOS:
+        entries = discover_keychain_entries()
+        print(f"\n🔑 Записи Keychain по маске 'Claude Code-credentials': {len(entries)}")
+        if not entries:
+            print("   Ничего не найдено. Claude Code нигде не залогинен.")
+
+        for svc, acct in entries:
+            print(f"\n   • service = {svc}")
+            print(f"     acct    = {acct or '(не определён)'}")
+            try:
+                res = subprocess.run(
+                    ["security", "find-generic-password"] + _keychain_args(svc, acct) + ["-w"],
+                    capture_output=True, text=True, check=True
+                )
+                raw = res.stdout.strip()
+            except subprocess.CalledProcessError as e:
+                print(f"     ❌ Чтение не удалось: {(e.stderr or '').strip() or e}")
+                continue
+
+            if not raw:
+                print("     ⚠️ Запись существует, но ПУСТАЯ — логина здесь нет.")
+                continue
+
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                print(f"     ⚠️ Содержимое не JSON ({len(raw)} симв.) — неизвестный формат.")
+                continue
+
+            print(f"     ключи верхнего уровня: {sorted(data.keys()) or '(пусто)'}")
+            oauth = data.get("claudeAiOauth")
+            if not oauth:
+                print("     ⚠️ Нет секции claudeAiOauth — скрипт такую запись не использует.")
+                continue
+
+            print(f"     access_token  : {mask_token(oauth.get('accessToken'))}")
+            print(f"     refresh_token : {mask_token(oauth.get('refreshToken'))}")
+            exp = oauth.get("expiresAt")
+            if exp:
+                try:
+                    exp_dt = datetime.fromtimestamp(int(exp) / 1000, timezone.utc)
+                    state = "истёк" if exp_dt < datetime.now(timezone.utc) else "действует"
+                    print(f"     expiresAt     : {format_local_time(exp_dt)} ({state})")
+                except Exception:
+                    print(f"     expiresAt     : {exp}")
+            if oauth.get("subscriptionType"):
+                print(f"     подписка      : {oauth.get('subscriptionType')}")
+
+    if IS_MACOS:
+        broad = scan_all_claude_keychain()
+        known = {svc for svc, _ in discover_keychain_entries()}
+        extra = [x for x in broad if x[0] not in known]
+        print(f"\n🔍 Все записи Keychain со словом 'Claude': {len(broad)}")
+        for svc, acct, mdat in broad:
+            mark = "  " if svc in known else "❗"
+            print(f"   {mark} {svc}  | acct={acct or '—'} | изменена: {mdat or '—'}")
+        if extra:
+            print("   ❗ — не подпадает под маску 'Claude Code-credentials' и скриптом НЕ используется.")
+
+    identities = scan_claude_identities()
+    print(f"\n🪪 Конфиги Claude Code (CLAUDE_CONFIG_DIR): {len(identities)}")
+    for path, email, mtime in identities:
+        print(f"   • {path}")
+        print(f"     аккаунт: {email or '(не залогинен)'} | изменён: "
+              f"{datetime.fromtimestamp(mtime, DISPLAY_TZ):%d.%m %H:%M}")
+    if len(identities) < 2:
+        print("   ⚠️ Изолированный конфиг только один — второй аккаунт Claude Code")
+        print("      негде хранить. Нужен отдельный CLAUDE_CONFIG_DIR для второго входа.")
+
+    files = scan_credential_files()
+    print(f"\n📄 Файловые хранилища учётных данных: {len(files)}")
+    for p in files:
+        print(f"   • {p} (изменён: {datetime.fromtimestamp(os.path.getmtime(p), DISPLAY_TZ):%d.%m %H:%M})")
+    if not files:
+        print("   Не найдено — на macOS это нормально, используется Keychain.")
+
+    config = load_config()
+    accounts = get_active_accounts(config)
+    print(f"\n👤 Аккаунтов, которые увидит скрипт: {len(accounts)}")
+    for idx, acc in enumerate(accounts, 1):
+        src = acc.get("keychain_service") if acc.get("type") == "keychain" else "config/ENV"
+        st_a, st_r = load_stored_tokens(account_key(acc), acc.get("refresh_token"))
+        print(f"   {idx}. {acc.get('name')} [{acc.get('type')}] источник={src} "
+              f"| в state: {'да' if (st_a or st_r) else 'нет'}")
+
+    exported = export_config().get("accounts", [])
+    print(f"\n📤 Попадёт в export: {len(exported)}")
+    for a in exported:
+        print(f"   • {a.get('name')} | access={mask_token(a.get('access_token'))}")
+
+    print("\n" + "=" * 62)
+    if IS_MACOS and len(exported) < 2:
+        print("Если аккаунтов меньше, чем ожидалось: в Keychain пишет именно Claude Code,")
+        print("а не десктопное приложение. Логин в Claude.app сам по себе записи не создаёт —")
+        print("нужно войти в CLI: запустите 'claude' и выполните /login.")
+    print()
+
 # --- CLI Entrypoint ---
 
 def main():
@@ -1365,6 +1552,7 @@ def main():
     subparsers.add_parser("accounts", help="Управление аккаунтами")
     subparsers.add_parser("export", help="Сформировать config.json с токенами для Coolify / Docker")
     subparsers.add_parser("daemon", help="Запустить фоновый монитор и Telegram бот")
+    subparsers.add_parser("doctor", help="Диагностика: какие учётные данные видит скрипт и почему")
 
     args = parser.parse_args()
     config = load_config()
@@ -1428,6 +1616,9 @@ def main():
 
     elif args.command == "daemon":
         run_daemon()
+
+    elif args.command == "doctor":
+        run_doctor()
 
 if __name__ == "__main__":
     main()
