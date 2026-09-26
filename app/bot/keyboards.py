@@ -84,6 +84,11 @@ def users_list(users: list[User]) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def retry_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        _btn("🔁 Начать заново", MenuCb(action="add"))]])
+
+
 def confirm_revoke(tg_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         _btn("✅ Отозвать", AdmCb(action="confirm_revoke", tg_id=tg_id)),
