@@ -1,16 +1,16 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
+ENV PYTHONUNBUFFERED=1 DB_PATH=/data/bot.db
 
-# Отключаем буферизацию вывода Python для мгновенного логирования в Coolify
-ENV PYTHONUNBUFFERED=1
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY claude_checker.py /app/claude_checker.py
+COPY app ./app
 
-RUN chmod +x /app/claude_checker.py
+VOLUME /data
 
-# Healthcheck для Coolify
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-  CMD python3 -c "import sys; sys.exit(0)"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import sqlite3,os; sqlite3.connect(os.environ['DB_PATH']).execute('select 1')"
 
-CMD ["python3", "claude_checker.py", "daemon"]
+CMD ["python", "-m", "app.main"]
