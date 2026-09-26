@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 import aiohttp
 from aiogram import Bot, Dispatcher
@@ -31,11 +32,14 @@ async def main() -> None:
     dp.include_routers(start.router, admin.router, add_account.router, menu.router)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    monitor = asyncio.create_task(run_monitor(bot, repo, http, settings.check_interval))
+    heartbeat_path = os.path.join(os.path.dirname(settings.db_path) or ".", "heartbeat")
+    monitor = asyncio.create_task(
+        run_monitor(bot, repo, http, settings.check_interval, heartbeat_path=heartbeat_path))
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:
         monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
         await http.close()
         await repo.close()
         await bot.session.close()

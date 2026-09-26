@@ -9,6 +9,7 @@ from aiogram.types import CallbackQuery, Message
 from app import report, usage
 from app.bot import keyboards
 from app.bot.callbacks import AccCb, MenuCb
+from app.bot.safe_edit import safe_edit
 from app.bot.start import MENU_TEXT
 from app.db import Repo, User
 
@@ -31,25 +32,25 @@ async def _usage_or_error(http, repo, acc):
 @router.callback_query(MenuCb.filter(F.action == "home"))
 async def home(cq: CallbackQuery, user: User, state: FSMContext):
     await state.clear()
-    await cq.message.edit_text(MENU_TEXT, reply_markup=keyboards.main_menu(user.is_admin))
+    await safe_edit(cq.message, MENU_TEXT, reply_markup=keyboards.main_menu(user.is_admin))
     await cq.answer()
 
 
 @router.callback_query(MenuCb.filter(F.action == "status"))
 async def status(cq: CallbackQuery, user: User, repo: Repo, http):
     await cq.answer("Проверяю…")
-    await cq.message.edit_text("⏳ <i>Проверяю лимиты аккаунтов…</i>")
+    await safe_edit(cq.message, "⏳ <i>Проверяю лимиты аккаунтов…</i>")
     accounts = await repo.list_accounts(user.tg_id)
     results = await asyncio.gather(*(_usage_or_error(http, repo, a) for a in accounts))
     items = [(a.label, u, e) for a, (u, e) in zip(accounts, results)]
-    await cq.message.edit_text(report.format_status(items), reply_markup=keyboards.back_home())
+    await safe_edit(cq.message, report.format_status(items), reply_markup=keyboards.back_home())
 
 
 @router.callback_query(MenuCb.filter(F.action == "accounts"))
 async def accounts(cq: CallbackQuery, user: User, repo: Repo):
     accs = await repo.list_accounts(user.tg_id)
     text = "🗂 <b>Ваши аккаунты</b>" if accs else "🗂 Аккаунтов пока нет."
-    await cq.message.edit_text(text, reply_markup=keyboards.accounts_list(accs))
+    await safe_edit(cq.message, text, reply_markup=keyboards.accounts_list(accs))
     await cq.answer()
 
 
@@ -62,8 +63,10 @@ async def show_card(message: Message, repo: Repo, http, user: User, acc_id: int,
     text = report.format_account(acc.label, u, e)
     if acc.email:
         text += f"\n\n📧 {escape(acc.email)}"
-    send = message.edit_text if edit else message.answer
-    await send(text, reply_markup=keyboards.account_card(acc))
+    if edit:
+        await safe_edit(message, text, reply_markup=keyboards.account_card(acc))
+    else:
+        await message.answer(text, reply_markup=keyboards.account_card(acc))
 
 
 @router.callback_query(AccCb.filter(F.action == "open"))
@@ -81,8 +84,8 @@ async def notify(cq: CallbackQuery, callback_data: AccCb, user: User, repo: Repo
 
 @router.callback_query(AccCb.filter(F.action == "delete"))
 async def delete(cq: CallbackQuery, callback_data: AccCb):
-    await cq.message.edit_text("🗑 Удалить аккаунт и его токены?",
-                               reply_markup=keyboards.confirm_delete(callback_data.id))
+    await safe_edit(cq.message, "🗑 Удалить аккаунт и его токены?",
+                    reply_markup=keyboards.confirm_delete(callback_data.id))
     await cq.answer()
 
 
@@ -91,7 +94,7 @@ async def confirm_delete(cq: CallbackQuery, callback_data: AccCb, user: User, re
     await repo.delete_account(callback_data.id, user.tg_id)
     await cq.answer("Удалено")
     accs = await repo.list_accounts(user.tg_id)
-    await cq.message.edit_text("🗂 <b>Ваши аккаунты</b>", reply_markup=keyboards.accounts_list(accs))
+    await safe_edit(cq.message, "🗂 <b>Ваши аккаунты</b>", reply_markup=keyboards.accounts_list(accs))
 
 
 @router.callback_query(AccCb.filter(F.action == "rename"))

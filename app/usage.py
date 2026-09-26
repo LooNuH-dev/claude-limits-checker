@@ -10,6 +10,15 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 TIMEOUT = aiohttp.ClientTimeout(total=10)
 REFRESH_SKEW = 60
 
+_refresh_locks: dict[int, asyncio.Lock] = {}
+
+
+def _lock_for(account_id: int) -> asyncio.Lock:
+    lock = _refresh_locks.get(account_id)
+    if lock is None:
+        lock = _refresh_locks[account_id] = asyncio.Lock()
+    return lock
+
 
 class NeedsRelogin(Exception):
     pass
@@ -43,15 +52,22 @@ async def fetch_usage(http: aiohttp.ClientSession, access_token: str, retries: i
 
 
 async def _refresh(http: aiohttp.ClientSession, repo: Repo, account: Account) -> str:
-    try:
-        ts = await oauth.refresh_tokens(http, account.refresh_token)
-    except oauth.InvalidGrant as e:
-        await repo.set_needs_relogin(account.id)
-        raise NeedsRelogin(str(e)) from e
-    await repo.update_tokens(account.id, ts.access_token, ts.refresh_token, ts.expires_at)
-    account.access_token, account.refresh_token = ts.access_token, ts.refresh_token
-    account.expires_at = ts.expires_at
-    return ts.access_token
+    async with _lock_for(account.id):
+        fresh = await repo.get_account(account.id)
+        if fresh and fresh.access_token != account.access_token:
+            # кто-то уже обновил токен, пока мы ждали лок
+            account.access_token, account.refresh_token = fresh.access_token, fresh.refresh_token
+            account.expires_at = fresh.expires_at
+            return fresh.access_token
+        try:
+            ts = await oauth.refresh_tokens(http, account.refresh_token)
+        except oauth.InvalidGrant as e:
+            await repo.set_needs_relogin(account.id)
+            raise NeedsRelogin(str(e)) from e
+        await repo.update_tokens(account.id, ts.access_token, ts.refresh_token, ts.expires_at)
+        account.access_token, account.refresh_token = ts.access_token, ts.refresh_token
+        account.expires_at = ts.expires_at
+        return ts.access_token
 
 
 async def fetch_account_usage(http: aiohttp.ClientSession, repo: Repo, account: Account) -> dict:

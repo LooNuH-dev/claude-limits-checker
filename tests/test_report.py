@@ -19,3 +19,15 @@ def test_status_escapes_and_errors():
 
 def test_status_empty():
     assert "Нет аккаунтов" in report.format_status([])
+
+
+def test_clip_short_text_unchanged():
+    assert report.clip("hello") == "hello"
+
+
+def test_clip_truncates_long_text():
+    text = "x" * 5000
+    out = report.clip(text, limit=100)
+    assert len(out) == 102
+    assert out.endswith("\n…")
+    assert out.startswith("x" * 100)

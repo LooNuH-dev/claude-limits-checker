@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 from app import report, usage
 from app.db import Account, Repo
@@ -47,7 +48,7 @@ async def check_account(http, repo: Repo, account: Account) -> Notice | None:
     return Notice(account.owner_tg_id, report.reset_text(account.label, percent))
 
 
-async def run_monitor(bot, repo: Repo, http, interval: int) -> None:
+async def run_monitor(bot, repo: Repo, http, interval: int, heartbeat_path: str | None = None) -> None:
     from app.bot.keyboards import relogin_kb
 
     sem = asyncio.Semaphore(CONCURRENCY)
@@ -69,4 +70,9 @@ async def run_monitor(bot, repo: Repo, http, interval: int) -> None:
             await asyncio.gather(*(one(a) for a in accounts))
         except Exception:
             log.exception("ошибка цикла мониторинга")
+        if heartbeat_path:
+            try:
+                Path(heartbeat_path).touch()
+            except Exception:
+                log.warning("не удалось обновить heartbeat", exc_info=True)
         await asyncio.sleep(interval)

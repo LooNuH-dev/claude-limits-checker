@@ -4,6 +4,12 @@ from html import escape
 DISPLAY_TZ = timezone(timedelta(hours=2))
 
 
+def clip(text: str, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n…"
+
+
 def parse_iso(value: str | None) -> datetime | None:
     if not value:
         return None
@@ -83,7 +89,7 @@ def format_status(items: list[tuple[str, dict | None, str | None]]) -> str:
     parts += [format_account(label, u, e) + "\n" for label, u, e in items]
     now = datetime.now(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M:%S (UTC+2)")
     parts.append(f"<i>Обновлено: {now}</i>")
-    return "\n".join(parts)
+    return clip("\n".join(parts))
 
 
 def limit_reached_text(label: str, reset: datetime | None) -> str:

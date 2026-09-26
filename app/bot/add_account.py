@@ -1,3 +1,5 @@
+from html import escape
+
 from aiogram import Bot, F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -7,6 +9,7 @@ from app import oauth
 from app.bot import keyboards
 from app.bot.callbacks import AccCb, MenuCb
 from app.bot.menu import show_card
+from app.bot.safe_edit import safe_edit
 from app.bot.start import MENU_TEXT
 from app.db import Repo, User
 
@@ -53,7 +56,7 @@ async def relogin(cq: CallbackQuery, callback_data: AccCb, state: FSMContext, re
 @router.callback_query(MenuCb.filter(F.action == "cancel"))
 async def cancel(cq: CallbackQuery, state: FSMContext, user: User):
     await state.clear()
-    await cq.message.edit_text(MENU_TEXT, reply_markup=keyboards.main_menu(user.is_admin))
+    await safe_edit(cq.message, MENU_TEXT, reply_markup=keyboards.main_menu(user.is_admin))
     await cq.answer("Отменено")
 
 
@@ -84,7 +87,7 @@ async def got_code(message: Message, state: FSMContext, repo: Repo, user: User, 
     try:
         ts = await oauth.exchange_code(http, code, expected, verifier)
     except oauth.OAuthError as e:
-        await status.edit_text(f"⚠️ Не удалось войти: {e}", reply_markup=retry)
+        await safe_edit(status, f"⚠️ Не удалось войти: {escape(str(e))}", reply_markup=retry)
         return
     if account_id:
         await repo.update_tokens(account_id, ts.access_token, ts.refresh_token, ts.expires_at)
@@ -93,5 +96,5 @@ async def got_code(message: Message, state: FSMContext, repo: Repo, user: User, 
         label = ts.email or f"Аккаунт {count + 1}"
         account_id = await repo.add_account(user.tg_id, label, ts.email, ts.access_token,
                                             ts.refresh_token, ts.expires_at)
-    await status.edit_text("✅ Аккаунт подключён.")
+    await safe_edit(status, "✅ Аккаунт подключён.")
     await show_card(message, repo, http, user, account_id, edit=False)

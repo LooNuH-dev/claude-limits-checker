@@ -1,3 +1,5 @@
+import asyncio
+
 import aiohttp
 import pytest
 
@@ -54,6 +56,26 @@ async def test_invalid_grant_marks_relogin(repo, fake_server, monkeypatch):
         with pytest.raises(usage.NeedsRelogin):
             await usage.fetch_account_usage(http, repo, acc)
     assert (await repo.get_account(acc.id)).needs_relogin
+
+
+async def test_concurrent_refresh_shares_single_token_call(repo, fake_server, monkeypatch):
+    monkeypatch.setattr(usage, "USAGE_URL", fake_server.url("/usage"))
+    monkeypatch.setattr(oauth, "TOKEN_URLS", [fake_server.url("/t1"), fake_server.url("/t2")])
+    acc = await _acc(repo, expires_at=1)
+    fake_server.add("POST", "/t1", json={"access_token": "NEW", "refresh_token": "R2"})
+    fake_server.add("GET", "/usage", json=USAGE)
+    fake_server.add("GET", "/usage", json=USAGE)
+    async with aiohttp.ClientSession() as http:
+        acc2 = await repo.get_account(acc.id)
+        results = await asyncio.gather(
+            usage.fetch_account_usage(http, repo, acc),
+            usage.fetch_account_usage(http, repo, acc2),
+        )
+    assert results == [USAGE, USAGE]
+    token_calls = [r for r in fake_server.requests if r[1] == "/t1"]
+    assert len(token_calls) == 1
+    saved = await repo.get_account(acc.id)
+    assert saved.needs_relogin is False
 
 
 async def test_429_retry(fake_server, monkeypatch):
