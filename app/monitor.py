@@ -47,7 +47,7 @@ async def check_account(http, repo: Repo, account: Account) -> Notice | None:
     return Notice(account.owner_tg_id, report.reset_text(account.label, percent))
 
 
-async def run_monitor(bot, repo: Repo, http, interval: int, send=None) -> None:
+async def run_monitor(bot, repo: Repo, http, interval: int) -> None:
     from app.bot.keyboards import relogin_kb
 
     sem = asyncio.Semaphore(CONCURRENCY)
