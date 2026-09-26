@@ -13,8 +13,9 @@
 ## Global Constraints
 
 - Python ≥ 3.11; зависимости только из `requirements.txt` / `requirements-dev.txt` ниже.
-- `OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"`, `REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"`.
-- Token endpoints (по порядку): `https://console.anthropic.com/v1/oauth/token`, `https://platform.claude.com/v1/oauth/token`.
+- `OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"`, `REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"`.
+- Token endpoints (по порядку): `https://platform.claude.com/v1/oauth/token`, `https://console.anthropic.com/v1/oauth/token`.
+- Authorize: `https://claude.com/cai/oauth/authorize`; scope `user:profile user:inference`; `state` — `secrets.token_urlsafe(32)` (короткий state сервер отклоняет с «Invalid request format»).
 - Usage endpoint: `https://api.anthropic.com/api/oauth/usage`, `User-Agent: claude-code/0.2.29`, `anthropic-version: 2023-06-01`.
 - Env: `BOT_TOKEN`, `ADMIN_TELEGRAM_ID`, `ENCRYPTION_KEY` (обязательные), `DB_PATH` (по умолч. `/data/bot.db`), `CHECK_INTERVAL` (сек, по умолч. 300, минимум 60), `INVITE_TTL` (сек, по умолч. 86400).
 - TTL `oauth_pending` = 600 сек.
@@ -51,32 +52,9 @@ tests/...
 
 ---
 
-### Task 0: Проверка подмены redirect_uri (spike, без кода в репо)
+### Task 0: Проверка подмены redirect_uri — ВЫПОЛНЕНО 2026-09-26
 
-Цель — подтвердить, что произвольный `redirect_uri` отклоняется, а ручной callback работает.
-
-- [ ] **Step 1: Сгенерировать две ссылки**
-
-```bash
-python3 - <<'EOF'
-import base64, hashlib, secrets, urllib.parse
-v = secrets.token_urlsafe(64)
-c = base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b"=").decode()
-for r in ["https://t.me/example_bot", "https://console.anthropic.com/oauth/code/callback"]:
-    print(r, "\n", "https://claude.ai/oauth/authorize?" + urllib.parse.urlencode({
-        "code": "true", "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-        "response_type": "code", "redirect_uri": r, "scope": "user:profile user:inference",
-        "code_challenge": c, "code_challenge_method": "S256", "state": "probe"}), "\n")
-EOF
-```
-
-- [ ] **Step 2: Открыть обе ссылки в браузере (пользователь, залогиненный в claude.ai)**
-
-Expected: для `t.me` — ошибка «invalid redirect_uri» (или аналог) до экрана Authorize; для callback — экран Authorize, после него страница с кодом вида `xxxx#probe`.
-
-- [ ] **Step 3: Зафиксировать результат**
-
-Если подмена на `t.me` **сработала** — остановиться и сообщить пользователю (флоу меняется, план пересматривается). Иначе продолжать. Если scope `user:inference` отклонён — повторить со `scope=user:profile` и использовать его как `SCOPES` в Task 3.
+Подмена отклонена сервером; штатный callback и scope проверены вручную. Параметры внесены в Global Constraints и Task 3.
 
 ---
 
@@ -755,8 +733,8 @@ def test_authorize_url():
 @pytest.mark.parametrize("text,expected", [
     ("abc#st", ("abc", "st")),
     ("  abc  ", ("abc", None)),
-    ("https://console.anthropic.com/oauth/code/callback?code=abc&state=st", ("abc", "st")),
-    ("https://console.anthropic.com/oauth/code/callback?code=abc#st", ("abc", "st")),
+    ("https://platform.claude.com/oauth/code/callback?code=abc&state=st", ("abc", "st")),
+    ("https://platform.claude.com/oauth/code/callback?code=abc#st", ("abc", "st")),
 ])
 def test_parse_code_input(text, expected):
     assert oauth.parse_code_input(text) == expected
@@ -818,12 +796,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import aiohttp
 
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-AUTHORIZE_URL = "https://claude.ai/oauth/authorize"
-REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
+AUTHORIZE_URL = "https://claude.com/cai/oauth/authorize"
+REDIRECT_URI = "https://platform.claude.com/oauth/code/callback"
 SCOPES = "user:profile user:inference"
 TOKEN_URLS = [
-    "https://console.anthropic.com/v1/oauth/token",
     "https://platform.claude.com/v1/oauth/token",
+    "https://console.anthropic.com/v1/oauth/token",
 ]
 USER_AGENT = "claude-code/0.2.29"
 TIMEOUT = aiohttp.ClientTimeout(total=15)
@@ -846,14 +824,14 @@ class TokenSet:
 
 
 def make_pkce() -> tuple[str, str]:
-    verifier = secrets.token_urlsafe(64)
+    verifier = secrets.token_urlsafe(32)
     digest = hashlib.sha256(verifier.encode()).digest()
     challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
     return verifier, challenge
 
 
 def new_state() -> str:
-    return secrets.token_urlsafe(24)
+    return secrets.token_urlsafe(32)
 
 
 def build_authorize_url(challenge: str, state: str) -> str:

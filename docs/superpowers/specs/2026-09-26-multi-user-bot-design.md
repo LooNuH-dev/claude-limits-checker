@@ -21,9 +21,9 @@
 
 Используется ручной OAuth-флоу клиента Claude Code (как `claude setup-token`):
 - `client_id` = `9d1c250a-e61b-44d9-88ed-5944d1962f5e`;
-- `redirect_uri` = `https://console.anthropic.com/oauth/code/callback` — страница показывает код с кнопкой Copy.
+- `redirect_uri` = `https://platform.claude.com/oauth/code/callback` — страница показывает код с кнопкой Copy.
 
-Произвольный редирект (на `t.me`/`tg://`) невозможен: сервер принимает только зарегистрированные для `client_id` redirect_uri; localhost-редирект уходит на устройство пользователя, а не на сервер. **Первый шаг реализации — проверить это живым запросом**; если подмена сработает, флоу упрощается.
+Произвольный редирект проверен 2026-09-26 и **невозможен**: «Redirect URI https://t.me/example_bot is not supported by client». Authorize: `https://claude.com/cai/oauth/authorize`, scope `user:profile user:inference`, `state` = `token_urlsafe(32)` (короткий state отклоняется).
 
 Шаги:
 1. Бот генерирует `code_verifier`/`code_challenge` (S256) и `state`, сохраняет в `oauth_pending` (TTL 10 мин), шлёт кнопку-ссылку authorize.
