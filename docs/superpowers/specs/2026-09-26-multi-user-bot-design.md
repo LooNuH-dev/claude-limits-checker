@@ -30,7 +30,7 @@
 2. Пользователь логинится, копирует код, вставляет в чат.
 3. Бот принимает `code#state`, голый код или URL целиком; сверяет `state` с `tg_id`; **удаляет сообщение с кодом**.
 4. Обмен кода на токены через `/v1/oauth/token`, получение email.
-5. Название: по умолчанию email, можно изменить. Сохранение, показ текущих лимитов.
+5. Аккаунт сохраняется сразу с названием = email (или «Аккаунт N»), показывается карточка с лимитами и кнопкой ✏️ «Переименовать».
 
 Отмена — кнопкой или по TTL.
 
@@ -59,7 +59,7 @@ tests/
 - `invites(token PK, created_by, expires_at, used_by, used_at)` — TTL по умолчанию 24 ч, одноразовые.
 - `accounts(id PK, owner_tg_id, label, email, access_token_enc, refresh_token_enc, expires_at, notify_enabled, needs_relogin, created_at)`
 - `account_state(account_id PK, last_5h_percent, was_limited, last_checked, last_error)`
-- `oauth_pending(state PK, tg_id, code_verifier_enc, expires_at)`
+- `oauth_pending(state PK, tg_id, code_verifier_enc, account_id NULL, expires_at)` — `account_id` задан при повторном входе в существующий аккаунт.
 
 Админ берётся из `ADMIN_TELEGRAM_ID` и upsert-ится в `users` с ролью `admin` при каждом старте.
 Токены и verifier шифруются Fernet ключом `ENCRYPTION_KEY`. Потеря ключа = все аккаунты надо переподключить (предупреждение в README).
