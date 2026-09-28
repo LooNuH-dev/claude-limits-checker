@@ -40,12 +40,25 @@ async def check_account(http, repo: Repo, account: Account) -> Notice | None:
 
     percent, reset_dt = report.five_hour(data)
     event = transition(was_limited, percent)
-    await repo.save_check(account.id, percent, percent >= 100.0, None)
-    if not event or not account.notify_enabled:
+    was_weekly = await repo.get_was_weekly_limited(account.id)
+    w_percent, w_reset_dt = report.seven_day(data)
+    w_event = transition(was_weekly, w_percent)
+    await repo.save_check(account.id, percent, percent >= 100.0, None,
+                          weekly_limited=w_percent >= 100.0)
+    if not account.notify_enabled:
         return None
+    texts = []
+    if w_event == "limited":
+        texts.append(report.weekly_limit_reached_text(account.label, w_reset_dt))
+    elif w_event == "reset":
+        texts.append(report.weekly_reset_text(account.label, w_percent))
     if event == "limited":
-        return Notice(account.owner_tg_id, report.limit_reached_text(account.label, reset_dt))
-    return Notice(account.owner_tg_id, report.reset_text(account.label, percent))
+        texts.append(report.limit_reached_text(account.label, reset_dt))
+    elif event == "reset":
+        texts.append(report.reset_text(account.label, percent))
+    if not texts:
+        return None
+    return Notice(account.owner_tg_id, "\n\n".join(texts))
 
 
 async def run_monitor(bot, repo: Repo, http, interval: int, heartbeat_path: str | None = None) -> None:

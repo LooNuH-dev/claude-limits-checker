@@ -56,3 +56,24 @@ async def test_relogin_notice(repo, monkeypatch):
     _fake_usage(monkeypatch, usage.NeedsRelogin("x"))
     n = await monitor.check_account(None, repo, acc)
     assert n.relogin_account_id == acc.id
+
+
+async def test_weekly_limit_then_reset(repo, monkeypatch):
+    acc = await _setup(repo)
+    _fake_usage(monkeypatch, {"five_hour": {"utilization": 10}, "seven_day": {"utilization": 100}})
+    n = await monitor.check_account(None, repo, acc)
+    assert "недельный лимит" in n.text
+    assert await repo.get_was_weekly_limited(acc.id)
+    assert await monitor.check_account(None, repo, acc) is None  # без дублей
+    _fake_usage(monkeypatch, {"five_hour": {"utilization": 10}, "seven_day": {"utilization": 0}})
+    n = await monitor.check_account(None, repo, acc)
+    assert "Недельный лимит" in n.text and "сбросился" in n.text
+
+
+async def test_weekly_state_kept_on_error(repo, monkeypatch):
+    acc = await _setup(repo)
+    _fake_usage(monkeypatch, {"seven_day": {"utilization": 100}})
+    await monitor.check_account(None, repo, acc)
+    _fake_usage(monkeypatch, RuntimeError("HTTP 503"))
+    await monitor.check_account(None, repo, acc)
+    assert await repo.get_was_weekly_limited(acc.id)

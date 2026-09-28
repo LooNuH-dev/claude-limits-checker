@@ -78,3 +78,21 @@ async def test_pending(repo):
     assert await repo.pop_pending("s1", 7, now=102) is None       # одноразово
     await repo.save_pending("s2", 7, "v", 3, now=100)
     assert await repo.pop_pending("s2", 7, now=701) is None       # TTL 600
+
+
+async def test_migration_from_v1(tmp_path):
+    import aiosqlite
+    from app.crypto import Cipher, generate_key
+    from app.db import SCHEMA, Repo
+    path = str(tmp_path / "v1.db")
+    async with aiosqlite.connect(path) as db:
+        await db.executescript(SCHEMA.replace("    was_weekly_limited INTEGER NOT NULL DEFAULT 0,\n", ""))
+        await db.execute("PRAGMA user_version=1")
+        await db.commit()
+    repo = await Repo.open(path, Cipher(generate_key()))
+    try:
+        assert await repo.get_was_weekly_limited(1) is False
+        async with repo.db.execute("PRAGMA table_info(account_state)") as cur:
+            assert "was_weekly_limited" in [r["name"] for r in await cur.fetchall()]
+    finally:
+        await repo.close()

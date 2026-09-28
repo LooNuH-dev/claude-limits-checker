@@ -54,6 +54,10 @@ def five_hour(usage: dict) -> tuple[float, datetime | None]:
     return _limit(usage, "five_hour")
 
 
+def seven_day(usage: dict) -> tuple[float, datetime | None]:
+    return _limit(usage, "seven_day")
+
+
 def _future(dt: datetime | None) -> bool:
     return bool(dt and dt > datetime.now(timezone.utc))
 
@@ -69,7 +73,7 @@ def format_account(label: str, usage: dict | None, error: str | None) -> str:
         lines.append(f"      • ⏳ Сброс через: <b>{countdown(r5)}</b> (в {local_time(r5)})")
     elif _future(r5):
         lines.append(f"      • ⏳ Сброс в: {local_time(r5)} (через {countdown(r5)})")
-    p7, r7 = _limit(usage, "seven_day")
+    p7, r7 = seven_day(usage)
     lines.append(f"   {emoji(p7)} <b>7-дневный лимит:</b> <code>{p7:.1f}%</code>")
     if _future(r7):
         lines.append(f"      • ⏳ Сброс в: {local_time(r7)} (через {countdown(r7)})")
@@ -104,6 +108,21 @@ def reset_text(label: str, percent: float) -> str:
     return (
         f"🎉 <b>[{escape(label)}] Лимиты Claude Code сбросились!</b>\n\n"
         f"🟢 5-часовой лимит доступен (использовано: <code>{percent:.1f}%</code>)."
+    )
+
+
+def weekly_limit_reached_text(label: str, reset: datetime | None) -> str:
+    return (
+        f"⛔️ <b>[{escape(label)}] Достигнут 100% недельный лимит Claude Code!</b>\n\n"
+        f"⏳ Сброс через: <b>{countdown(reset)}</b> (в {local_time(reset)})\n\n"
+        "🔔 Пришлю уведомление, как только недельный лимит сбросится."
+    )
+
+
+def weekly_reset_text(label: str, percent: float) -> str:
+    return (
+        f"🎉 <b>[{escape(label)}] Недельный лимит Claude Code сбросился!</b>\n\n"
+        f"🟢 7-дневный лимит доступен (использовано: <code>{percent:.1f}%</code>)."
     )
 
 

@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS account_state(
     account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
     last_5h_percent REAL,
     was_limited INTEGER NOT NULL DEFAULT 0,
+    was_weekly_limited INTEGER NOT NULL DEFAULT 0,
     last_checked INTEGER,
     last_error TEXT
 );
@@ -51,7 +52,7 @@ CREATE TABLE IF NOT EXISTS oauth_pending(
     expires_at INTEGER NOT NULL
 );
 """
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _now(now: int | None) -> int:
@@ -97,6 +98,10 @@ class Repo:
         async with db.execute("PRAGMA user_version") as cur:
             version = (await cur.fetchone())[0]
         if version < SCHEMA_VERSION:
+            if version == 1:
+                await db.execute(
+                    "ALTER TABLE account_state ADD COLUMN was_weekly_limited INTEGER NOT NULL DEFAULT 0"
+                )
             await db.executescript(SCHEMA)
             await db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             await db.commit()
@@ -266,16 +271,25 @@ class Repo:
         st = await self.get_state(account_id)
         return bool(st and st["was_limited"])
 
+    async def get_was_weekly_limited(self, account_id: int) -> bool:
+        st = await self.get_state(account_id)
+        return bool(st and st["was_weekly_limited"])
+
     async def save_check(self, account_id: int, percent: float | None, was_limited: bool,
-                         error: str | None, now: int | None = None) -> None:
-        # percent=None (ошибка) не затирает последнее известное значение
+                         error: str | None, now: int | None = None,
+                         weekly_limited: bool | None = None) -> None:
+        # percent=None (ошибка) не затирает последнее известное значение,
+        # weekly_limited=None — последнее известное состояние недельного лимита
+        weekly = None if weekly_limited is None else int(weekly_limited)
         await self.db.execute(
-            "INSERT INTO account_state(account_id, last_5h_percent, was_limited, last_checked, last_error) "
-            "VALUES(?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET "
+            "INSERT INTO account_state(account_id, last_5h_percent, was_limited, was_weekly_limited, "
+            "last_checked, last_error) "
+            "VALUES(?,?,?,COALESCE(?,0),?,?) ON CONFLICT(account_id) DO UPDATE SET "
             "last_5h_percent=COALESCE(excluded.last_5h_percent, last_5h_percent), "
-            "was_limited=excluded.was_limited, last_checked=excluded.last_checked, "
-            "last_error=excluded.last_error",
-            (account_id, percent, int(was_limited), _now(now), error),
+            "was_limited=excluded.was_limited, "
+            "was_weekly_limited=COALESCE(?, was_weekly_limited), "
+            "last_checked=excluded.last_checked, last_error=excluded.last_error",
+            (account_id, percent, int(was_limited), weekly, _now(now), error, weekly),
         )
         await self.db.commit()
 
