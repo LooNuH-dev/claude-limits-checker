@@ -41,10 +41,6 @@ def local_time(target: datetime | None) -> str:
     return target.astimezone(DISPLAY_TZ).strftime("%H:%M (%d.%m UTC+2)")
 
 
-def emoji(percent: float) -> str:
-    return "🔴" if percent >= 100 else "🟡" if percent >= 80 else "🟢"
-
-
 def _limit(usage: dict, key: str) -> tuple[float, datetime | None]:
     block = usage.get(key) or {}
     return float(block.get("utilization") or 0.0), parse_iso(block.get("resets_at"))
@@ -62,61 +58,60 @@ def _future(dt: datetime | None) -> bool:
     return bool(dt and dt > datetime.now(timezone.utc))
 
 
+def _reset_line(reset: datetime | None) -> str | None:
+    if not _future(reset):
+        return None
+    return f"  сброс в {local_time(reset)}, через {countdown(reset)}"
+
+
 def format_account(label: str, usage: dict | None, error: str | None) -> str:
-    lines = [f"👤 <b>{escape(label)}</b>"]
+    lines = [f"<b>{escape(label)}</b>"]
     if error or usage is None:
-        lines.append(f"   ⚠️ <i>Ошибка: {escape(error or 'нет данных')}</i>")
+        lines.append(f"Ошибка: {escape(error or 'нет данных')}")
         return "\n".join(lines)
-    p5, r5 = five_hour(usage)
-    lines.append(f"   {emoji(p5)} <b>5-часовой лимит:</b> <code>{p5:.1f}%</code>")
-    if p5 >= 100:
-        lines.append(f"      • ⏳ Сброс через: <b>{countdown(r5)}</b> (в {local_time(r5)})")
-    elif _future(r5):
-        lines.append(f"      • ⏳ Сброс в: {local_time(r5)} (через {countdown(r5)})")
-    p7, r7 = seven_day(usage)
-    lines.append(f"   {emoji(p7)} <b>7-дневный лимит:</b> <code>{p7:.1f}%</code>")
-    if _future(r7):
-        lines.append(f"      • ⏳ Сброс в: {local_time(r7)} (через {countdown(r7)})")
+    for name, (p, r) in (("5 часов", five_hour(usage)), ("7 дней", seven_day(usage))):
+        lines.append(f"{name}: {p:.1f}%")
+        if (reset := _reset_line(r)):
+            lines.append(reset)
     extra = usage.get("extra_usage") or {}
     if extra.get("is_enabled"):
         pe = float(extra.get("utilization") or 0.0)
         used = float(extra.get("used_credits") or 0.0) / 100
         limit = float(extra.get("monthly_limit") or 0.0) / 100
-        lines.append(f"   {emoji(pe)} <b>Extra Usage:</b> <code>{pe:.1f}%</code> (${used:.2f} / ${limit:.2f})")
+        lines.append(f"Extra Usage: {pe:.1f}% (${used:.2f} из ${limit:.2f})")
     return "\n".join(lines)
 
 
 def format_status(items: list[tuple[str, dict | None, str | None]]) -> str:
     if not items:
-        return "⚠️ Нет аккаунтов. Добавьте аккаунт через меню."
-    parts = [f"📊 <b>Состояние лимитов Claude Code</b> ({len(items)} акк.)\n"]
-    parts += [format_account(label, u, e) + "\n" for label, u, e in items]
-    now = datetime.now(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M:%S (UTC+2)")
-    parts.append(f"<i>Обновлено: {now}</i>")
-    return clip("\n".join(parts))
+        return "Нет аккаунтов. Добавьте аккаунт через меню."
+    parts = [format_account(label, u, e) for label, u, e in items]
+    now = datetime.now(DISPLAY_TZ).strftime("%d.%m.%Y %H:%M (UTC+2)")
+    parts.append(f"Обновлено: {now}")
+    return clip("\n\n".join(parts))
 
 
 def limit_reached_text(label: str, reset: datetime | None) -> str:
     return (
-        f"[{escape(label)}] 5-часовой лимит: 100%.\n"
+        f"🔴 [{escape(label)}] 5-часовой лимит: 100%.\n"
         f"Сброс в {local_time(reset)}, через {countdown(reset)}."
     )
 
 
 def reset_text(label: str, percent: float) -> str:
-    return f"[{escape(label)}] 5-часовой лимит сбросился, использовано {percent:.1f}%."
+    return f"🟢 [{escape(label)}] 5-часовой лимит сбросился, использовано {percent:.1f}%."
 
 
 def weekly_limit_reached_text(label: str, reset: datetime | None) -> str:
     return (
-        f"[{escape(label)}] Недельный лимит: 100%.\n"
+        f"🔴 [{escape(label)}] Недельный лимит: 100%.\n"
         f"Сброс в {local_time(reset)}, через {countdown(reset)}."
     )
 
 
 def weekly_reset_text(label: str, percent: float) -> str:
-    return f"[{escape(label)}] Недельный лимит сбросился, использовано {percent:.1f}%."
+    return f"🟢 [{escape(label)}] Недельный лимит сбросился, использовано {percent:.1f}%."
 
 
 def relogin_text(label: str) -> str:
-    return f"[{escape(label)}] Сессия истекла, мониторинг остановлен. Нужен повторный вход."
+    return f"🔑 [{escape(label)}] Сессия истекла, мониторинг остановлен. Нужен повторный вход."
