@@ -34,7 +34,7 @@ async def test_limit_then_reset(repo, monkeypatch):
     assert await monitor.check_account(None, repo, acc) is None  # без дублей
     _fake_usage(monkeypatch, {"five_hour": {"utilization": 3}})
     n = await monitor.check_account(None, repo, acc)
-    assert "сбросились" in n.text
+    assert "5-часовой лимит сбросился" in n.text
 
 
 async def test_notify_disabled_still_tracks_state(repo, monkeypatch):
@@ -62,7 +62,7 @@ async def test_weekly_limit_then_reset(repo, monkeypatch):
     acc = await _setup(repo)
     _fake_usage(monkeypatch, {"five_hour": {"utilization": 10}, "seven_day": {"utilization": 100}})
     n = await monitor.check_account(None, repo, acc)
-    assert "недельный лимит" in n.text
+    assert "Недельный лимит: 100%" in n.text
     assert await repo.get_was_weekly_limited(acc.id)
     assert await monitor.check_account(None, repo, acc) is None  # без дублей
     _fake_usage(monkeypatch, {"five_hour": {"utilization": 10}, "seven_day": {"utilization": 0}})

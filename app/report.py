@@ -98,36 +98,25 @@ def format_status(items: list[tuple[str, dict | None, str | None]]) -> str:
 
 def limit_reached_text(label: str, reset: datetime | None) -> str:
     return (
-        f"⚠️ <b>[{escape(label)}] Достигнут 100% лимит Claude Code!</b>\n\n"
-        f"⏳ Сброс через: <b>{countdown(reset)}</b> (в {local_time(reset)})\n\n"
-        "🔔 Пришлю уведомление, как только лимит сбросится."
+        f"[{escape(label)}] 5-часовой лимит: 100%.\n"
+        f"Сброс в {local_time(reset)}, через {countdown(reset)}."
     )
 
 
 def reset_text(label: str, percent: float) -> str:
-    return (
-        f"🎉 <b>[{escape(label)}] Лимиты Claude Code сбросились!</b>\n\n"
-        f"🟢 5-часовой лимит доступен (использовано: <code>{percent:.1f}%</code>)."
-    )
+    return f"[{escape(label)}] 5-часовой лимит сбросился, использовано {percent:.1f}%."
 
 
 def weekly_limit_reached_text(label: str, reset: datetime | None) -> str:
     return (
-        f"⛔️ <b>[{escape(label)}] Достигнут 100% недельный лимит Claude Code!</b>\n\n"
-        f"⏳ Сброс через: <b>{countdown(reset)}</b> (в {local_time(reset)})\n\n"
-        "🔔 Пришлю уведомление, как только недельный лимит сбросится."
+        f"[{escape(label)}] Недельный лимит: 100%.\n"
+        f"Сброс в {local_time(reset)}, через {countdown(reset)}."
     )
 
 
 def weekly_reset_text(label: str, percent: float) -> str:
-    return (
-        f"🎉 <b>[{escape(label)}] Недельный лимит Claude Code сбросился!</b>\n\n"
-        f"🟢 7-дневный лимит доступен (использовано: <code>{percent:.1f}%</code>)."
-    )
+    return f"[{escape(label)}] Недельный лимит сбросился, использовано {percent:.1f}%."
 
 
 def relogin_text(label: str) -> str:
-    return (
-        f"🔑 <b>[{escape(label)}] Сессия истекла.</b>\n"
-        "Войдите в аккаунт заново, чтобы продолжить мониторинг."
-    )
+    return f"[{escape(label)}] Сессия истекла, мониторинг остановлен. Нужен повторный вход."
